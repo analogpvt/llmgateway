@@ -4384,6 +4384,7 @@ chat.openapi(completions, async (c) => {
 							cachedInputCost: streamingCosts.cachedInputCost,
 							requestCost: streamingCosts.requestCost,
 							webSearchCost: streamingCosts.webSearchCost,
+							contentFilterCost: streamingCosts.contentFilterCost,
 							imageInputCost: streamingCosts.imageInputCost,
 							imageOutputCost: streamingCosts.imageOutputCost,
 							totalCost: streamingCosts.totalCost,
@@ -5241,6 +5242,7 @@ chat.openapi(completions, async (c) => {
 							cachedInputCost: contentFilterCosts?.cachedInputCost ?? null,
 							requestCost: contentFilterCosts?.requestCost ?? null,
 							webSearchCost: contentFilterCosts?.webSearchCost ?? null,
+							contentFilterCost: contentFilterCosts?.contentFilterCost ?? null,
 							imageInputTokens: null,
 							imageOutputTokens: null,
 							imageInputCost: contentFilterCosts?.imageInputCost ?? null,
@@ -7448,6 +7450,7 @@ chat.openapi(completions, async (c) => {
 											cachedInputCost: streamingCostsEarly.cachedInputCost,
 											requestCost: streamingCostsEarly.requestCost,
 											webSearchCost: streamingCostsEarly.webSearchCost,
+											contentFilterCost: streamingCostsEarly.contentFilterCost,
 											imageInputCost: streamingCostsEarly.imageInputCost,
 											imageOutputCost: streamingCostsEarly.imageOutputCost,
 											totalCost: streamingCostsEarly.totalCost,
@@ -7822,6 +7825,7 @@ chat.openapi(completions, async (c) => {
 						cachedInputCost: costs.cachedInputCost,
 						requestCost: costs.requestCost,
 						webSearchCost: costs.webSearchCost,
+						contentFilterCost: costs.contentFilterCost ?? null,
 						imageInputTokens: costs.imageInputTokens?.toString() ?? null,
 						imageOutputTokens: costs.imageOutputTokens?.toString() ?? null,
 						imageInputCost: costs.imageInputCost ?? null,
@@ -8702,6 +8706,8 @@ chat.openapi(completions, async (c) => {
 				cachedInputCost: nonStreamContentFilterCosts?.cachedInputCost ?? null,
 				requestCost: nonStreamContentFilterCosts?.requestCost ?? null,
 				webSearchCost: nonStreamContentFilterCosts?.webSearchCost ?? null,
+				contentFilterCost:
+					nonStreamContentFilterCosts?.contentFilterCost ?? null,
 				imageInputTokens: null,
 				imageOutputTokens: null,
 				imageInputCost: nonStreamContentFilterCosts?.imageInputCost ?? null,
@@ -8766,6 +8772,33 @@ chat.openapi(completions, async (c) => {
 			// For content_filter, return a proper completion response (not an error)
 			// This handles Azure ResponsibleAIPolicyViolation and similar content filtering errors
 			if (finishReason === "content_filter") {
+				const cfPromptTokens = Math.max(
+					1,
+					Math.round(nonStreamContentFilterPromptTokens ?? 1),
+				);
+				const contentFilterUsage: Record<string, any> = {
+					prompt_tokens: cfPromptTokens,
+					completion_tokens: 0,
+					total_tokens: cfPromptTokens,
+				};
+				if (nonStreamContentFilterCosts) {
+					applyExtendedUsageFields(contentFilterUsage, {
+						costs: {
+							inputCost: nonStreamContentFilterCosts.inputCost,
+							outputCost: nonStreamContentFilterCosts.outputCost,
+							cachedInputCost: nonStreamContentFilterCosts.cachedInputCost,
+							requestCost: nonStreamContentFilterCosts.requestCost,
+							webSearchCost: nonStreamContentFilterCosts.webSearchCost,
+							contentFilterCost: nonStreamContentFilterCosts.contentFilterCost,
+							imageInputCost: nonStreamContentFilterCosts.imageInputCost,
+							imageOutputCost: nonStreamContentFilterCosts.imageOutputCost,
+							totalCost: nonStreamContentFilterCosts.totalCost,
+						},
+						cachedTokens: null,
+						cacheCreationTokens: null,
+						reasoningTokens: null,
+					});
+				}
 				return c.json({
 					id: `chatcmpl-${Date.now()}`,
 					object: "chat.completion",
@@ -8781,11 +8814,7 @@ chat.openapi(completions, async (c) => {
 							finish_reason: "content_filter",
 						},
 					],
-					usage: {
-						prompt_tokens: 0,
-						completion_tokens: 0,
-						total_tokens: 0,
-					},
+					usage: contentFilterUsage,
 					metadata: {
 						request_id: requestId,
 						requested_model: initialRequestedModel,
@@ -9432,6 +9461,7 @@ chat.openapi(completions, async (c) => {
 					cachedInputCost: costs.cachedInputCost,
 					requestCost: costs.requestCost,
 					webSearchCost: costs.webSearchCost,
+					contentFilterCost: costs.contentFilterCost,
 					imageInputCost: costs.imageInputCost,
 					imageOutputCost: costs.imageOutputCost,
 					totalCost: costs.totalCost,
@@ -9578,6 +9608,7 @@ chat.openapi(completions, async (c) => {
 		cachedInputCost: costs.cachedInputCost,
 		requestCost: costs.requestCost,
 		webSearchCost: costs.webSearchCost,
+		contentFilterCost: costs.contentFilterCost ?? null,
 		imageInputTokens: costs.imageInputTokens?.toString() ?? null,
 		imageOutputTokens: costs.imageOutputTokens?.toString() ?? null,
 		imageInputCost: costs.imageInputCost ?? null,
