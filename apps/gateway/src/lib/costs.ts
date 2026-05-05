@@ -101,6 +101,7 @@ export async function calculateCosts(
 	webSearchCount: number | null = null,
 	organizationId: string | null = null,
 	imageQuality?: string,
+	contentFilterTriggered = false,
 ) {
 	// Find the model info - try both base model name and provider model name
 	// Strip :region suffix if present (e.g., "deepseek-v3.2:cn-beijing" → "deepseek-v3.2")
@@ -124,6 +125,7 @@ export async function calculateCosts(
 			cachedInputCost: null,
 			requestCost: null,
 			webSearchCost: null,
+			contentFilterCost: null,
 			imageInputTokens: null,
 			imageOutputTokens: null,
 			imageInputCost: null,
@@ -196,6 +198,7 @@ export async function calculateCosts(
 			cachedInputCost: null,
 			requestCost: null,
 			webSearchCost: null,
+			contentFilterCost: null,
 			imageInputTokens: null,
 			imageOutputTokens: null,
 			imageInputCost: null,
@@ -235,6 +238,7 @@ export async function calculateCosts(
 			cachedInputCost: null,
 			requestCost: null,
 			webSearchCost: null,
+			contentFilterCost: null,
 			imageInputTokens: null,
 			imageOutputTokens: null,
 			imageInputCost: null,
@@ -382,13 +386,20 @@ export async function calculateCosts(
 			? webSearchPrice.times(webSearchCount).times(discountMultiplier)
 			: new Decimal(0);
 
+	// Provider content filter fee, e.g. xAI's $0.05 per usage-policy rejection.
+	const contentFilterPrice = new Decimal(providerInfo.contentFilterPrice ?? 0);
+	const contentFilterCost = contentFilterTriggered
+		? contentFilterPrice.times(discountMultiplier)
+		: new Decimal(0);
+
 	// Note: inputCost already includes imageInputCost and outputCost already
 	// includes imageOutputCost when applicable, so they are not added separately.
 	const totalCost = inputCost
 		.plus(outputCost)
 		.plus(cachedInputCost)
 		.plus(requestCost)
-		.plus(webSearchCost);
+		.plus(webSearchCost)
+		.plus(contentFilterCost);
 
 	return {
 		inputCost: inputCost.toNumber(),
@@ -396,6 +407,7 @@ export async function calculateCosts(
 		cachedInputCost: cachedInputCost.toNumber(),
 		requestCost: requestCost.toNumber(),
 		webSearchCost: webSearchCost.toNumber(),
+		contentFilterCost: contentFilterCost.toNumber(),
 		imageInputTokens,
 		imageOutputTokens,
 		imageInputCost: imageInputCost?.toNumber() ?? null,
