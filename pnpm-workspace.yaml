@@ -3,6 +3,9 @@ packages:
   - packages/*
   - ee/*
 
+allowBuilds:
+  protobufjs: true
+
 ignoredBuiltDependencies:
   - protobufjs
   - unrs-resolver
