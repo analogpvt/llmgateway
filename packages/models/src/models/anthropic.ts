@@ -288,6 +288,7 @@ export const anthropicModels = [
 				vision: false,
 				tools: true,
 				jsonOutputSchema: true,
+				regions: [{ id: "global" }, { id: "us" }, { id: "eu" }, { id: "apac" }, { id: "us-east-1" }, { id: "us-east-2" }, { id: "us-west-1" }, { id: "us-west-2" }, { id: "ca-central-1" }, { id: "ca-west-1" }, { id: "eu-central-1" }, { id: "eu-central-2" }, { id: "eu-north-1" }, { id: "eu-south-1" }, { id: "eu-south-2" }, { id: "eu-west-1" }, { id: "eu-west-2" }, { id: "eu-west-3" }, { id: "ap-east-2" }, { id: "ap-northeast-1" }, { id: "ap-northeast-2" }, { id: "ap-northeast-3" }, { id: "ap-south-1" }, { id: "ap-south-2" }, { id: "ap-southeast-1" }, { id: "ap-southeast-2" }, { id: "ap-southeast-3" }, { id: "ap-southeast-4" }, { id: "ap-southeast-5" }, { id: "ap-southeast-6" }, { id: "ap-southeast-7" }, { id: "il-central-1" }, { id: "me-central-1" }, { id: "me-south-1" }, { id: "af-south-1" }, { id: "sa-east-1" }, { id: "mx-central-1" }],
 			},
 			{
 				test: "skip",
@@ -358,6 +359,7 @@ export const anthropicModels = [
 				vision: false,
 				tools: true,
 				jsonOutputSchema: true,
+				regions: [{ id: "global" }, { id: "us" }, { id: "eu" }, { id: "apac" }, { id: "us-east-1" }, { id: "us-east-2" }, { id: "us-west-1" }, { id: "us-west-2" }, { id: "ca-central-1" }, { id: "ca-west-1" }, { id: "eu-central-1" }, { id: "eu-central-2" }, { id: "eu-north-1" }, { id: "eu-south-1" }, { id: "eu-south-2" }, { id: "eu-west-1" }, { id: "eu-west-2" }, { id: "eu-west-3" }, { id: "ap-east-2" }, { id: "ap-northeast-1" }, { id: "ap-northeast-2" }, { id: "ap-northeast-3" }, { id: "ap-south-1" }, { id: "ap-south-2" }, { id: "ap-southeast-1" }, { id: "ap-southeast-2" }, { id: "ap-southeast-3" }, { id: "ap-southeast-4" }, { id: "ap-southeast-5" }, { id: "ap-southeast-6" }, { id: "ap-southeast-7" }, { id: "il-central-1" }, { id: "me-central-1" }, { id: "me-south-1" }, { id: "af-south-1" }, { id: "sa-east-1" }, { id: "mx-central-1" }],
 			},
 		],
 	},
@@ -408,6 +410,7 @@ export const anthropicModels = [
 				vision: true,
 				tools: true,
 				jsonOutputSchema: true,
+				regions: [{ id: "global" }, { id: "us" }, { id: "eu" }, { id: "apac" }, { id: "us-east-1" }, { id: "us-east-2" }, { id: "us-west-1" }, { id: "us-west-2" }, { id: "ca-central-1" }, { id: "ca-west-1" }, { id: "eu-central-1" }, { id: "eu-central-2" }, { id: "eu-north-1" }, { id: "eu-south-1" }, { id: "eu-south-2" }, { id: "eu-west-1" }, { id: "eu-west-2" }, { id: "eu-west-3" }, { id: "ap-east-2" }, { id: "ap-northeast-1" }, { id: "ap-northeast-2" }, { id: "ap-northeast-3" }, { id: "ap-south-1" }, { id: "ap-south-2" }, { id: "ap-southeast-1" }, { id: "ap-southeast-2" }, { id: "ap-southeast-3" }, { id: "ap-southeast-4" }, { id: "ap-southeast-5" }, { id: "ap-southeast-6" }, { id: "ap-southeast-7" }, { id: "il-central-1" }, { id: "me-central-1" }, { id: "me-south-1" }, { id: "af-south-1" }, { id: "sa-east-1" }, { id: "mx-central-1" }],
 			},
 			{
 				test: "skip",
@@ -492,7 +495,7 @@ export const anthropicModels = [
 				tools: true,
 				jsonOutput: true,
 				jsonOutputSchema: true,
-				regions: [{ id: "global" }, { id: "us" }, { id: "eu" }, { id: "apac" }],
+				regions: [{ id: "global" }, { id: "us" }, { id: "eu" }, { id: "apac" }, { id: "us-east-1" }, { id: "us-east-2" }, { id: "us-west-1" }, { id: "us-west-2" }, { id: "ca-central-1" }, { id: "ca-west-1" }, { id: "eu-central-1" }, { id: "eu-central-2" }, { id: "eu-north-1" }, { id: "eu-south-1" }, { id: "eu-south-2" }, { id: "eu-west-1" }, { id: "eu-west-2" }, { id: "eu-west-3" }, { id: "ap-east-2" }, { id: "ap-northeast-1" }, { id: "ap-northeast-2" }, { id: "ap-northeast-3" }, { id: "ap-south-1" }, { id: "ap-south-2" }, { id: "ap-southeast-1" }, { id: "ap-southeast-2" }, { id: "ap-southeast-3" }, { id: "ap-southeast-4" }, { id: "ap-southeast-5" }, { id: "ap-southeast-6" }, { id: "ap-southeast-7" }, { id: "il-central-1" }, { id: "me-central-1" }, { id: "me-south-1" }, { id: "af-south-1" }, { id: "sa-east-1" }, { id: "mx-central-1" }],
 			},
 			{
 				providerId: "vertex-anthropic",
@@ -557,6 +560,7 @@ export const anthropicModels = [
 				tools: true,
 				jsonOutput: true,
 				jsonOutputSchema: true,
+				regions: [{ id: "global" }, { id: "us" }, { id: "eu" }, { id: "apac" }, { id: "us-east-1" }, { id: "us-east-2" }, { id: "us-west-1" }, { id: "us-west-2" }, { id: "ca-central-1" }, { id: "ca-west-1" }, { id: "eu-central-1" }, { id: "eu-central-2" }, { id: "eu-north-1" }, { id: "eu-south-1" }, { id: "eu-south-2" }, { id: "eu-west-1" }, { id: "eu-west-2" }, { id: "eu-west-3" }, { id: "ap-east-2" }, { id: "ap-northeast-1" }, { id: "ap-northeast-2" }, { id: "ap-northeast-3" }, { id: "ap-south-1" }, { id: "ap-south-2" }, { id: "ap-southeast-1" }, { id: "ap-southeast-2" }, { id: "ap-southeast-3" }, { id: "ap-southeast-4" }, { id: "ap-southeast-5" }, { id: "ap-southeast-6" }, { id: "ap-southeast-7" }, { id: "il-central-1" }, { id: "me-central-1" }, { id: "me-south-1" }, { id: "af-south-1" }, { id: "sa-east-1" }, { id: "mx-central-1" }],
 			},
 		],
 	},
@@ -899,6 +903,7 @@ export const anthropicModels = [
 				vision: true,
 				tools: true,
 				jsonOutputSchema: true,
+				regions: [{ id: "global" }, { id: "us" }, { id: "eu" }, { id: "apac" }, { id: "us-east-1" }, { id: "us-east-2" }, { id: "us-west-1" }, { id: "us-west-2" }, { id: "ca-central-1" }, { id: "ca-west-1" }, { id: "eu-central-1" }, { id: "eu-central-2" }, { id: "eu-north-1" }, { id: "eu-south-1" }, { id: "eu-south-2" }, { id: "eu-west-1" }, { id: "eu-west-2" }, { id: "eu-west-3" }, { id: "ap-east-2" }, { id: "ap-northeast-1" }, { id: "ap-northeast-2" }, { id: "ap-northeast-3" }, { id: "ap-south-1" }, { id: "ap-south-2" }, { id: "ap-southeast-1" }, { id: "ap-southeast-2" }, { id: "ap-southeast-3" }, { id: "ap-southeast-4" }, { id: "ap-southeast-5" }, { id: "ap-southeast-6" }, { id: "ap-southeast-7" }, { id: "il-central-1" }, { id: "me-central-1" }, { id: "me-south-1" }, { id: "af-south-1" }, { id: "sa-east-1" }, { id: "mx-central-1" }],
 			},
 			{
 				test: "skip",
@@ -992,6 +997,7 @@ export const anthropicModels = [
 				vision: true,
 				tools: true,
 				jsonOutputSchema: true,
+				regions: [{ id: "global" }, { id: "us" }, { id: "eu" }, { id: "apac" }, { id: "us-east-1" }, { id: "us-east-2" }, { id: "us-west-1" }, { id: "us-west-2" }, { id: "ca-central-1" }, { id: "ca-west-1" }, { id: "eu-central-1" }, { id: "eu-central-2" }, { id: "eu-north-1" }, { id: "eu-south-1" }, { id: "eu-south-2" }, { id: "eu-west-1" }, { id: "eu-west-2" }, { id: "eu-west-3" }, { id: "ap-east-2" }, { id: "ap-northeast-1" }, { id: "ap-northeast-2" }, { id: "ap-northeast-3" }, { id: "ap-south-1" }, { id: "ap-south-2" }, { id: "ap-southeast-1" }, { id: "ap-southeast-2" }, { id: "ap-southeast-3" }, { id: "ap-southeast-4" }, { id: "ap-southeast-5" }, { id: "ap-southeast-6" }, { id: "ap-southeast-7" }, { id: "il-central-1" }, { id: "me-central-1" }, { id: "me-south-1" }, { id: "af-south-1" }, { id: "sa-east-1" }, { id: "mx-central-1" }],
 			},
 			{
 				test: "skip",
@@ -1066,6 +1072,7 @@ export const anthropicModels = [
 				streaming: true,
 				vision: true,
 				tools: true,
+				regions: [{ id: "global" }, { id: "us" }, { id: "eu" }, { id: "apac" }, { id: "us-east-1" }, { id: "us-east-2" }, { id: "us-west-1" }, { id: "us-west-2" }, { id: "ca-central-1" }, { id: "ca-west-1" }, { id: "eu-central-1" }, { id: "eu-central-2" }, { id: "eu-north-1" }, { id: "eu-south-1" }, { id: "eu-south-2" }, { id: "eu-west-1" }, { id: "eu-west-2" }, { id: "eu-west-3" }, { id: "ap-east-2" }, { id: "ap-northeast-1" }, { id: "ap-northeast-2" }, { id: "ap-northeast-3" }, { id: "ap-south-1" }, { id: "ap-south-2" }, { id: "ap-southeast-1" }, { id: "ap-southeast-2" }, { id: "ap-southeast-3" }, { id: "ap-southeast-4" }, { id: "ap-southeast-5" }, { id: "ap-southeast-6" }, { id: "ap-southeast-7" }, { id: "il-central-1" }, { id: "me-central-1" }, { id: "me-south-1" }, { id: "af-south-1" }, { id: "sa-east-1" }, { id: "mx-central-1" }],
 			},
 			{
 				providerId: "vertex-anthropic",
@@ -1137,6 +1144,7 @@ export const anthropicModels = [
 				streaming: true,
 				vision: true,
 				tools: true,
+				regions: [{ id: "global" }, { id: "us" }, { id: "eu" }, { id: "apac" }, { id: "us-east-1" }, { id: "us-east-2" }, { id: "us-west-1" }, { id: "us-west-2" }, { id: "ca-central-1" }, { id: "ca-west-1" }, { id: "eu-central-1" }, { id: "eu-central-2" }, { id: "eu-north-1" }, { id: "eu-south-1" }, { id: "eu-south-2" }, { id: "eu-west-1" }, { id: "eu-west-2" }, { id: "eu-west-3" }, { id: "ap-east-2" }, { id: "ap-northeast-1" }, { id: "ap-northeast-2" }, { id: "ap-northeast-3" }, { id: "ap-south-1" }, { id: "ap-south-2" }, { id: "ap-southeast-1" }, { id: "ap-southeast-2" }, { id: "ap-southeast-3" }, { id: "ap-southeast-4" }, { id: "ap-southeast-5" }, { id: "ap-southeast-6" }, { id: "ap-southeast-7" }, { id: "il-central-1" }, { id: "me-central-1" }, { id: "me-south-1" }, { id: "af-south-1" }, { id: "sa-east-1" }, { id: "mx-central-1" }],
 			},
 		],
 	},
