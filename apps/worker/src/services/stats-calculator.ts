@@ -5,43 +5,45 @@ import {
 	modelProviderMapping,
 	modelProviderMappingHistory,
 	modelHistory,
+	modelProviderMappingHistoryHourly,
+	modelHistoryHourly,
+	routingElectionHourly,
 	log,
 	sql,
+	asc,
 	eq,
 	gte,
 	lt,
 	and,
+	type SQL,
 } from "@llmgateway/db";
 import { logger } from "@llmgateway/logger";
+
+import { excludeRecoveredSameProviderRegionRetry } from "./log-filters.js";
+import { calculateRoutingTelemetryForHour } from "./routing-telemetry-aggregator.js";
 
 // Environment variable for backfill duration in seconds (defaults to 300 seconds = 5 minutes)
 const BACKFILL_DURATION_SECONDS =
 	Number(process.env.BACKFILL_DURATION_SECONDS) || 300;
 
+// Safety cap on how many hourly buckets a single backfill pass will compute,
+// so a large gap (or a corrupt timestamp) can't tie the worker up indefinitely.
+const HOURLY_BACKFILL_MAX_ITERATIONS =
+	Number(process.env.HOURLY_BACKFILL_MAX_ITERATIONS) || 24 * 400;
+
 const ONE_MINUTE_MS = 60 * 1000;
+const ONE_HOUR_MS = 60 * ONE_MINUTE_MS;
 const usedModelWithRegionSql = sql<string>`split_part(${log.usedModel}, '/', 2)`;
 const usedBaseModelSql = sql<string>`split_part(${usedModelWithRegionSql}, ':', 1)`;
 const usedRegionSql = sql<
 	string | null
 >`nullif(split_part(${usedModelWithRegionSql}, ':', 2), '')`;
-
-function excludeRecoveredSameProviderRegionRetry() {
-	return sql<boolean>`not (
-		coalesce(${log.hasError}, false) = true
-		and coalesce(${log.retried}, false) = true
-		and exists (
-			select 1
-			from "log" as final_retry_log
-			where final_retry_log.id = ${log.retriedByLogId}
-				and final_retry_log.used_provider = ${log.usedProvider}
-				and coalesce(final_retry_log.has_error, false) = false
-				and nullif(
-					split_part(split_part(final_retry_log.used_model, '/', 2), ':', 2),
-					''
-				) is not distinct from ${usedRegionSql}
-		)
-	)`;
-}
+// Where the requested tier came from. routingMetadata is a `json` column, so it
+// needs an explicit jsonb cast before `->>`. Absent on rows written before the
+// field existed, which `coalesce` treats as an explicit request.
+const serviceTierSourceSql = sql<
+	string | null
+>`(${log.routingMetadata}::jsonb ->> 'serviceTierSource')`;
 
 interface MappingMinuteStats {
 	modelId: string | null;
@@ -67,7 +69,16 @@ interface MappingMinuteStats {
 	totalDuration: number;
 	totalTimeToFirstToken: number;
 	totalTimeToFirstReasoningToken: number;
+	timeToFirstTokenCount: number;
+	timeToFirstReasoningTokenCount: number;
 	totalCost: number;
+	totalInputCost: number;
+	totalOutputCost: number;
+	totalCachedInputCost: number;
+	serviceTierExplicitCount: number;
+	serviceTierImplicitCount: number;
+	serviceTierServedCount: number;
+	serviceTierUnconfirmedCount: number;
 }
 
 function createEmptyMappingMinuteStats(
@@ -98,7 +109,16 @@ function createEmptyMappingMinuteStats(
 		totalDuration: 0,
 		totalTimeToFirstToken: 0,
 		totalTimeToFirstReasoningToken: 0,
+		timeToFirstTokenCount: 0,
+		timeToFirstReasoningTokenCount: 0,
 		totalCost: 0,
+		totalInputCost: 0,
+		totalOutputCost: 0,
+		totalCachedInputCost: 0,
+		serviceTierExplicitCount: 0,
+		serviceTierImplicitCount: 0,
+		serviceTierServedCount: 0,
+		serviceTierUnconfirmedCount: 0,
 	};
 }
 
@@ -127,8 +147,81 @@ function mergeMappingMinuteStats(
 	target.totalTimeToFirstToken += source.totalTimeToFirstToken;
 	target.totalTimeToFirstReasoningToken +=
 		source.totalTimeToFirstReasoningToken;
+	target.timeToFirstTokenCount += source.timeToFirstTokenCount;
+	target.timeToFirstReasoningTokenCount +=
+		source.timeToFirstReasoningTokenCount;
 	target.totalCost += source.totalCost;
+	target.totalInputCost += source.totalInputCost;
+	target.totalOutputCost += source.totalOutputCost;
+	target.totalCachedInputCost += source.totalCachedInputCost;
+	target.serviceTierExplicitCount += source.serviceTierExplicitCount;
+	target.serviceTierImplicitCount += source.serviceTierImplicitCount;
+	target.serviceTierServedCount += source.serviceTierServedCount;
+	target.serviceTierUnconfirmedCount += source.serviceTierUnconfirmedCount;
 	return target;
+}
+
+// Metric columns shared by model_history and model_provider_mapping_history that
+// are overwritten on conflict. Used to build a single bulk upsert SET clause so
+// the per-minute history write is one statement instead of one round-trip (and
+// one implicit transaction/fsync) per model and per mapping.
+const HISTORY_METRIC_COLUMNS = [
+	"logsCount",
+	"errorsCount",
+	"clientErrorsCount",
+	"gatewayErrorsCount",
+	"upstreamErrorsCount",
+	"completedCount",
+	"lengthLimitCount",
+	"contentFilterCount",
+	"toolCallsCount",
+	"canceledCount",
+	"unknownFinishCount",
+	"cachedCount",
+	"totalInputTokens",
+	"totalOutputTokens",
+	"totalTokens",
+	"totalReasoningTokens",
+	"totalCachedTokens",
+	"totalDuration",
+	"totalTimeToFirstToken",
+	"totalTimeToFirstReasoningToken",
+	"timeToFirstTokenCount",
+	"timeToFirstReasoningTokenCount",
+	"totalCost",
+	"totalInputCost",
+	"totalOutputCost",
+	"totalCachedInputCost",
+	"serviceTierExplicitCount",
+	"serviceTierImplicitCount",
+	"serviceTierServedCount",
+	"serviceTierUnconfirmedCount",
+] as const;
+
+// Chunk size for bulk upserts. Postgres caps a statement at 65535 bind
+// parameters; history rows have ~25 columns, so 1000 rows stays well under it.
+const HISTORY_UPSERT_CHUNK_SIZE = 1000;
+
+// The schema uses Drizzle's global `casing: "snake_case"`, so a column's `.name`
+// is the camelCase logical name and the snake_case DB name is only resolved at
+// SQL-build time. The raw `excluded.<column>` reference below needs the actual
+// DB column name, so convert it the same way Drizzle does.
+function toSnakeCase(name: string): string {
+	return name.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase();
+}
+
+// Build the ON CONFLICT DO UPDATE SET clause for a history table, taking each
+// metric value from the row being inserted (`excluded`) so a single multi-row
+// statement updates every conflicting row correctly.
+function buildHistoryUpsertSet(
+	columns: Record<(typeof HISTORY_METRIC_COLUMNS)[number], { name: string }>,
+): Record<string, SQL> {
+	const set: Record<string, SQL> = {};
+	for (const key of HISTORY_METRIC_COLUMNS) {
+		set[key] = sql`excluded.${sql.identifier(toSnakeCase(columns[key].name))}`;
+	}
+	set.updatedAt = sql`now()`;
+	return set;
 }
 
 /**
@@ -160,6 +253,30 @@ function getCurrentMinuteStart(): Date {
 function getPreviousMinuteStart(): Date {
 	const currentMinute = getCurrentMinuteStart();
 	return new Date(currentMinute.getTime() - ONE_MINUTE_MS);
+}
+
+/**
+ * Helper function to round any date to the start of its hour (00 minutes, 00
+ * seconds, 00 milliseconds). Mirrors roundToMinuteStart so hourly buckets align
+ * to the same wall-clock basis as the minute history they roll up.
+ */
+function roundToHourStart(date: Date): Date {
+	return new Date(
+		date.getFullYear(),
+		date.getMonth(),
+		date.getDate(),
+		date.getHours(),
+		0,
+		0,
+		0,
+	);
+}
+
+/**
+ * Helper function to get the start of the current hour (rounded down)
+ */
+function getCurrentHourStart(): Date {
+	return roundToHourStart(new Date());
 }
 
 /**
@@ -254,7 +371,52 @@ async function calculateModelHistoryForMinute(targetMinute: Date) {
 				sql<number>`coalesce(sum(${log.timeToFirstReasoningToken}), 0)::int`.as(
 					"totalTimeToFirstReasoningToken",
 				),
+			// Only streamed, non-cached, successful requests record a
+			// time-to-first-token, so the averages must divide by how many samples
+			// there actually were rather than by the request count.
+			timeToFirstTokenCount:
+				sql<number>`count(${log.timeToFirstToken})::int`.as(
+					"timeToFirstTokenCount",
+				),
+			timeToFirstReasoningTokenCount:
+				sql<number>`count(${log.timeToFirstReasoningToken})::int`.as(
+					"timeToFirstReasoningTokenCount",
+				),
 			totalCost: sql<number>`coalesce(sum(${log.cost}), 0)`.as("totalCost"),
+			totalInputCost: sql<number>`coalesce(sum(${log.inputCost}), 0)`.as(
+				"totalInputCost",
+			),
+			totalOutputCost: sql<number>`coalesce(sum(${log.outputCost}), 0)`.as(
+				"totalOutputCost",
+			),
+			totalCachedInputCost:
+				sql<number>`coalesce(sum(${log.cachedInputCost}), 0)`.as(
+					"totalCachedInputCost",
+				),
+			// Service-tier coverage. `requestedServiceTier` holds the tier the gateway
+			// actually asked for, which for a coding-plan org may be a default the
+			// client never sent — `routingMetadata.serviceTierSource` is the only
+			// thing that separates the two, so `implicit` reads it. `unconfirmed`
+			// counts premium-tier requests the response never confirmed: a Google
+			// downgrade to standard and a provider that reports no tier at all look
+			// identical here, and both bill at the standard rate, so it is
+			// deliberately not called a downgrade.
+			serviceTierExplicitCount:
+				sql<number>`sum(case when ${log.requestedServiceTier} is not null and coalesce(${serviceTierSourceSql}, 'request') = 'request' then 1 else 0 end)::int`.as(
+					"serviceTierExplicitCount",
+				),
+			serviceTierImplicitCount:
+				sql<number>`sum(case when ${log.requestedServiceTier} is not null and ${serviceTierSourceSql} = 'coding-plan-default' then 1 else 0 end)::int`.as(
+					"serviceTierImplicitCount",
+				),
+			serviceTierServedCount:
+				sql<number>`sum(case when ${log.usedServiceTier} is not null then 1 else 0 end)::int`.as(
+					"serviceTierServedCount",
+				),
+			serviceTierUnconfirmedCount:
+				sql<number>`sum(case when ${log.requestedServiceTier} is not null and ${log.usedServiceTier} is null then 1 else 0 end)::int`.as(
+					"serviceTierUnconfirmedCount",
+				),
 		})
 		.from(log)
 		.where(
@@ -284,6 +446,7 @@ async function calculateModelHistoryForMinute(targetMinute: Date) {
 
 	// Process all models
 	const processedModels = new Set<string>();
+	const modelHistoryValues: (typeof modelHistory.$inferInsert)[] = [];
 
 	for (const modelEntry of allModels) {
 		if (processedModels.has(modelEntry.modelId)) {
@@ -315,62 +478,69 @@ async function calculateModelHistoryForMinute(targetMinute: Date) {
 		const totalTimeToFirstToken = stat?.totalTimeToFirstToken ?? 0;
 		const totalTimeToFirstReasoningToken =
 			stat?.totalTimeToFirstReasoningToken ?? 0;
+		const timeToFirstTokenCount = stat?.timeToFirstTokenCount ?? 0;
+		const timeToFirstReasoningTokenCount =
+			stat?.timeToFirstReasoningTokenCount ?? 0;
 		const totalCost = stat?.totalCost ?? 0;
+		const totalInputCost = stat?.totalInputCost ?? 0;
+		const totalOutputCost = stat?.totalOutputCost ?? 0;
+		const totalCachedInputCost = stat?.totalCachedInputCost ?? 0;
+		const serviceTierExplicitCount = stat?.serviceTierExplicitCount ?? 0;
+		const serviceTierImplicitCount = stat?.serviceTierImplicitCount ?? 0;
+		const serviceTierServedCount = stat?.serviceTierServedCount ?? 0;
+		const serviceTierUnconfirmedCount = stat?.serviceTierUnconfirmedCount ?? 0;
 
-		// Insert or update a history record for this minute
+		// Collect the history record for this minute; written in one bulk upsert
+		// below instead of a per-model round-trip.
+		modelHistoryValues.push({
+			modelId: modelEntry.modelId,
+			minuteTimestamp: roundedTargetMinute,
+			logsCount,
+			errorsCount,
+			clientErrorsCount,
+			gatewayErrorsCount,
+			upstreamErrorsCount,
+			completedCount,
+			lengthLimitCount,
+			contentFilterCount,
+			toolCallsCount,
+			canceledCount,
+			unknownFinishCount,
+			cachedCount,
+			totalInputTokens,
+			totalOutputTokens,
+			totalTokens,
+			totalReasoningTokens,
+			totalCachedTokens,
+			totalDuration,
+			totalTimeToFirstToken,
+			totalTimeToFirstReasoningToken,
+			timeToFirstTokenCount,
+			timeToFirstReasoningTokenCount,
+			totalCost,
+			totalInputCost,
+			totalOutputCost,
+			totalCachedInputCost,
+			serviceTierExplicitCount,
+			serviceTierImplicitCount,
+			serviceTierServedCount,
+			serviceTierUnconfirmedCount,
+		});
+	}
+
+	const modelHistoryUpsertSet = buildHistoryUpsertSet(modelHistory);
+	for (
+		let i = 0;
+		i < modelHistoryValues.length;
+		i += HISTORY_UPSERT_CHUNK_SIZE
+	) {
+		const chunk = modelHistoryValues.slice(i, i + HISTORY_UPSERT_CHUNK_SIZE);
 		await database
 			.insert(modelHistory)
-			.values({
-				modelId: modelEntry.modelId,
-				minuteTimestamp: roundedTargetMinute,
-				logsCount,
-				errorsCount,
-				clientErrorsCount,
-				gatewayErrorsCount,
-				upstreamErrorsCount,
-				completedCount,
-				lengthLimitCount,
-				contentFilterCount,
-				toolCallsCount,
-				canceledCount,
-				unknownFinishCount,
-				cachedCount,
-				totalInputTokens,
-				totalOutputTokens,
-				totalTokens,
-				totalReasoningTokens,
-				totalCachedTokens,
-				totalDuration,
-				totalTimeToFirstToken,
-				totalTimeToFirstReasoningToken,
-				totalCost,
-			})
+			.values(chunk)
 			.onConflictDoUpdate({
 				target: [modelHistory.modelId, modelHistory.minuteTimestamp],
-				set: {
-					logsCount,
-					errorsCount,
-					clientErrorsCount,
-					gatewayErrorsCount,
-					upstreamErrorsCount,
-					completedCount,
-					lengthLimitCount,
-					contentFilterCount,
-					toolCallsCount,
-					canceledCount,
-					unknownFinishCount,
-					cachedCount,
-					totalInputTokens,
-					totalOutputTokens,
-					totalTokens,
-					totalReasoningTokens,
-					totalCachedTokens,
-					totalDuration,
-					totalTimeToFirstToken,
-					totalTimeToFirstReasoningToken,
-					totalCost,
-					updatedAt: new Date(),
-				},
+				set: modelHistoryUpsertSet,
 			});
 	}
 
@@ -475,7 +645,52 @@ async function calculateHistoryForMinute(targetMinute: Date) {
 				sql<number>`coalesce(sum(${log.timeToFirstReasoningToken}), 0)::int`.as(
 					"totalTimeToFirstReasoningToken",
 				),
+			// Only streamed, non-cached, successful requests record a
+			// time-to-first-token, so the averages must divide by how many samples
+			// there actually were rather than by the request count.
+			timeToFirstTokenCount:
+				sql<number>`count(${log.timeToFirstToken})::int`.as(
+					"timeToFirstTokenCount",
+				),
+			timeToFirstReasoningTokenCount:
+				sql<number>`count(${log.timeToFirstReasoningToken})::int`.as(
+					"timeToFirstReasoningTokenCount",
+				),
 			totalCost: sql<number>`coalesce(sum(${log.cost}), 0)`.as("totalCost"),
+			totalInputCost: sql<number>`coalesce(sum(${log.inputCost}), 0)`.as(
+				"totalInputCost",
+			),
+			totalOutputCost: sql<number>`coalesce(sum(${log.outputCost}), 0)`.as(
+				"totalOutputCost",
+			),
+			totalCachedInputCost:
+				sql<number>`coalesce(sum(${log.cachedInputCost}), 0)`.as(
+					"totalCachedInputCost",
+				),
+			// Service-tier coverage. `requestedServiceTier` holds the tier the gateway
+			// actually asked for, which for a coding-plan org may be a default the
+			// client never sent — `routingMetadata.serviceTierSource` is the only
+			// thing that separates the two, so `implicit` reads it. `unconfirmed`
+			// counts premium-tier requests the response never confirmed: a Google
+			// downgrade to standard and a provider that reports no tier at all look
+			// identical here, and both bill at the standard rate, so it is
+			// deliberately not called a downgrade.
+			serviceTierExplicitCount:
+				sql<number>`sum(case when ${log.requestedServiceTier} is not null and coalesce(${serviceTierSourceSql}, 'request') = 'request' then 1 else 0 end)::int`.as(
+					"serviceTierExplicitCount",
+				),
+			serviceTierImplicitCount:
+				sql<number>`sum(case when ${log.requestedServiceTier} is not null and ${serviceTierSourceSql} = 'coding-plan-default' then 1 else 0 end)::int`.as(
+					"serviceTierImplicitCount",
+				),
+			serviceTierServedCount:
+				sql<number>`sum(case when ${log.usedServiceTier} is not null then 1 else 0 end)::int`.as(
+					"serviceTierServedCount",
+				),
+			serviceTierUnconfirmedCount:
+				sql<number>`sum(case when ${log.requestedServiceTier} is not null and ${log.usedServiceTier} is null then 1 else 0 end)::int`.as(
+					"serviceTierUnconfirmedCount",
+				),
 		})
 		.from(log)
 		.where(
@@ -561,6 +776,8 @@ async function calculateHistoryForMinute(targetMinute: Date) {
 
 	// Process all model-provider mappings
 	const processedMappings = new Set<string>();
+	const mappingHistoryValues: (typeof modelProviderMappingHistory.$inferInsert)[] =
+		[];
 
 	let activeMappingsCount = 0;
 
@@ -596,71 +813,80 @@ async function calculateHistoryForMinute(targetMinute: Date) {
 		const totalTimeToFirstToken = stat?.totalTimeToFirstToken ?? 0;
 		const totalTimeToFirstReasoningToken =
 			stat?.totalTimeToFirstReasoningToken ?? 0;
+		const timeToFirstTokenCount = stat?.timeToFirstTokenCount ?? 0;
+		const timeToFirstReasoningTokenCount =
+			stat?.timeToFirstReasoningTokenCount ?? 0;
 		const totalCost = stat?.totalCost ?? 0;
+		const totalInputCost = stat?.totalInputCost ?? 0;
+		const totalOutputCost = stat?.totalOutputCost ?? 0;
+		const totalCachedInputCost = stat?.totalCachedInputCost ?? 0;
+		const serviceTierExplicitCount = stat?.serviceTierExplicitCount ?? 0;
+		const serviceTierImplicitCount = stat?.serviceTierImplicitCount ?? 0;
+		const serviceTierServedCount = stat?.serviceTierServedCount ?? 0;
+		const serviceTierUnconfirmedCount = stat?.serviceTierUnconfirmedCount ?? 0;
 
 		if (logsCount > 0) {
 			activeMappingsCount++;
 		}
 
-		// Insert or update a history record for this minute
+		// Collect the history record for this minute; written in one bulk upsert
+		// below instead of a per-mapping round-trip.
+		mappingHistoryValues.push({
+			modelId: mapping.modelId, // LLMGateway model name
+			providerId: mapping.providerId,
+			modelProviderMappingId: mapping.id, // Exact model_provider_mapping.id
+			minuteTimestamp: roundedTargetMinute,
+			logsCount,
+			errorsCount,
+			clientErrorsCount,
+			gatewayErrorsCount,
+			upstreamErrorsCount,
+			completedCount,
+			lengthLimitCount,
+			contentFilterCount,
+			toolCallsCount,
+			canceledCount,
+			unknownFinishCount,
+			cachedCount,
+			totalInputTokens,
+			totalOutputTokens,
+			totalTokens,
+			totalReasoningTokens,
+			totalCachedTokens,
+			totalDuration,
+			totalTimeToFirstToken,
+			totalTimeToFirstReasoningToken,
+			timeToFirstTokenCount,
+			timeToFirstReasoningTokenCount,
+			totalCost,
+			totalInputCost,
+			totalOutputCost,
+			totalCachedInputCost,
+			serviceTierExplicitCount,
+			serviceTierImplicitCount,
+			serviceTierServedCount,
+			serviceTierUnconfirmedCount,
+		});
+	}
+
+	const mappingHistoryUpsertSet = buildHistoryUpsertSet(
+		modelProviderMappingHistory,
+	);
+	for (
+		let i = 0;
+		i < mappingHistoryValues.length;
+		i += HISTORY_UPSERT_CHUNK_SIZE
+	) {
+		const chunk = mappingHistoryValues.slice(i, i + HISTORY_UPSERT_CHUNK_SIZE);
 		await database
 			.insert(modelProviderMappingHistory)
-			.values({
-				modelId: mapping.modelId, // LLMGateway model name
-				providerId: mapping.providerId,
-				modelProviderMappingId: mapping.id, // Exact model_provider_mapping.id
-				minuteTimestamp: roundedTargetMinute,
-				logsCount,
-				errorsCount,
-				clientErrorsCount,
-				gatewayErrorsCount,
-				upstreamErrorsCount,
-				completedCount,
-				lengthLimitCount,
-				contentFilterCount,
-				toolCallsCount,
-				canceledCount,
-				unknownFinishCount,
-				cachedCount,
-				totalInputTokens,
-				totalOutputTokens,
-				totalTokens,
-				totalReasoningTokens,
-				totalCachedTokens,
-				totalDuration,
-				totalTimeToFirstToken,
-				totalTimeToFirstReasoningToken,
-				totalCost,
-			})
+			.values(chunk)
 			.onConflictDoUpdate({
 				target: [
 					modelProviderMappingHistory.modelProviderMappingId,
 					modelProviderMappingHistory.minuteTimestamp,
 				],
-				set: {
-					logsCount,
-					errorsCount,
-					clientErrorsCount,
-					gatewayErrorsCount,
-					upstreamErrorsCount,
-					completedCount,
-					lengthLimitCount,
-					contentFilterCount,
-					toolCallsCount,
-					canceledCount,
-					unknownFinishCount,
-					cachedCount,
-					totalInputTokens,
-					totalOutputTokens,
-					totalTokens,
-					totalReasoningTokens,
-					totalCachedTokens,
-					totalDuration,
-					totalTimeToFirstToken,
-					totalTimeToFirstReasoningToken,
-					totalCost,
-					updatedAt: new Date(),
-				},
+				set: mappingHistoryUpsertSet,
 			});
 	}
 
@@ -852,6 +1078,369 @@ export async function calculateCurrentMinuteHistory() {
 		);
 	} catch (error) {
 		logger.error("Error calculating current minute history:", error as Error);
+		throw error;
+	}
+}
+
+/**
+ * Roll up one hour of model_history (the 60 minute rows) into a single
+ * model_history_hourly row per model. Idempotent: re-running an hour recomputes
+ * its totals from the current minute data and overwrites the existing row.
+ * @param targetHour Any time within the hour to aggregate
+ */
+async function calculateModelHistoryForHour(targetHour: Date) {
+	const roundedHour = roundToHourStart(targetHour);
+	const hourEnd = new Date(roundedHour.getTime() + ONE_HOUR_MS);
+	const database = db;
+
+	const hourlyStats = await database
+		.select({
+			modelId: modelHistory.modelId,
+			logsCount: sql<number>`coalesce(sum(${modelHistory.logsCount}), 0)::int`,
+			errorsCount: sql<number>`coalesce(sum(${modelHistory.errorsCount}), 0)::int`,
+			clientErrorsCount: sql<number>`coalesce(sum(${modelHistory.clientErrorsCount}), 0)::int`,
+			gatewayErrorsCount: sql<number>`coalesce(sum(${modelHistory.gatewayErrorsCount}), 0)::int`,
+			upstreamErrorsCount: sql<number>`coalesce(sum(${modelHistory.upstreamErrorsCount}), 0)::int`,
+			completedCount: sql<number>`coalesce(sum(${modelHistory.completedCount}), 0)::int`,
+			lengthLimitCount: sql<number>`coalesce(sum(${modelHistory.lengthLimitCount}), 0)::int`,
+			contentFilterCount: sql<number>`coalesce(sum(${modelHistory.contentFilterCount}), 0)::int`,
+			toolCallsCount: sql<number>`coalesce(sum(${modelHistory.toolCallsCount}), 0)::int`,
+			canceledCount: sql<number>`coalesce(sum(${modelHistory.canceledCount}), 0)::int`,
+			unknownFinishCount: sql<number>`coalesce(sum(${modelHistory.unknownFinishCount}), 0)::int`,
+			cachedCount: sql<number>`coalesce(sum(${modelHistory.cachedCount}), 0)::int`,
+			totalInputTokens: sql<number>`coalesce(sum(${modelHistory.totalInputTokens}), 0)::bigint`,
+			totalOutputTokens: sql<number>`coalesce(sum(${modelHistory.totalOutputTokens}), 0)::bigint`,
+			totalTokens: sql<number>`coalesce(sum(${modelHistory.totalTokens}), 0)::bigint`,
+			totalReasoningTokens: sql<number>`coalesce(sum(${modelHistory.totalReasoningTokens}), 0)::bigint`,
+			totalCachedTokens: sql<number>`coalesce(sum(${modelHistory.totalCachedTokens}), 0)::bigint`,
+			totalDuration: sql<number>`coalesce(sum(${modelHistory.totalDuration}), 0)::int`,
+			totalTimeToFirstToken: sql<number>`coalesce(sum(${modelHistory.totalTimeToFirstToken}), 0)::int`,
+			totalTimeToFirstReasoningToken: sql<number>`coalesce(sum(${modelHistory.totalTimeToFirstReasoningToken}), 0)::int`,
+			timeToFirstTokenCount: sql<number>`coalesce(sum(${modelHistory.timeToFirstTokenCount}), 0)::int`,
+			timeToFirstReasoningTokenCount: sql<number>`coalesce(sum(${modelHistory.timeToFirstReasoningTokenCount}), 0)::int`,
+			totalCost: sql<number>`coalesce(sum(${modelHistory.totalCost}), 0)`,
+			totalInputCost: sql<number>`coalesce(sum(${modelHistory.totalInputCost}), 0)`,
+			totalOutputCost: sql<number>`coalesce(sum(${modelHistory.totalOutputCost}), 0)`,
+			totalCachedInputCost: sql<number>`coalesce(sum(${modelHistory.totalCachedInputCost}), 0)`,
+			serviceTierExplicitCount: sql<number>`coalesce(sum(${modelHistory.serviceTierExplicitCount}), 0)::int`,
+			serviceTierImplicitCount: sql<number>`coalesce(sum(${modelHistory.serviceTierImplicitCount}), 0)::int`,
+			serviceTierServedCount: sql<number>`coalesce(sum(${modelHistory.serviceTierServedCount}), 0)::int`,
+			serviceTierUnconfirmedCount: sql<number>`coalesce(sum(${modelHistory.serviceTierUnconfirmedCount}), 0)::int`,
+		})
+		.from(modelHistory)
+		.where(
+			and(
+				gte(modelHistory.minuteTimestamp, roundedHour),
+				lt(modelHistory.minuteTimestamp, hourEnd),
+			),
+		)
+		.groupBy(modelHistory.modelId);
+
+	for (const row of hourlyStats) {
+		const { modelId, ...stats } = row;
+		await database
+			.insert(modelHistoryHourly)
+			.values({ modelId, hourTimestamp: roundedHour, ...stats })
+			.onConflictDoUpdate({
+				target: [modelHistoryHourly.modelId, modelHistoryHourly.hourTimestamp],
+				set: { ...stats, updatedAt: new Date() },
+			});
+	}
+
+	return { totalModels: hourlyStats.length };
+}
+
+/**
+ * Roll up one hour of model_provider_mapping_history (the 60 minute rows) into a
+ * single model_provider_mapping_history_hourly row per mapping. Idempotent.
+ * @param targetHour Any time within the hour to aggregate
+ */
+async function calculateMappingHistoryForHour(targetHour: Date) {
+	const roundedHour = roundToHourStart(targetHour);
+	const hourEnd = new Date(roundedHour.getTime() + ONE_HOUR_MS);
+	const database = db;
+
+	const hourlyStats = await database
+		.select({
+			modelProviderMappingId:
+				modelProviderMappingHistory.modelProviderMappingId,
+			modelId: modelProviderMappingHistory.modelId,
+			providerId: modelProviderMappingHistory.providerId,
+			logsCount: sql<number>`coalesce(sum(${modelProviderMappingHistory.logsCount}), 0)::int`,
+			errorsCount: sql<number>`coalesce(sum(${modelProviderMappingHistory.errorsCount}), 0)::int`,
+			clientErrorsCount: sql<number>`coalesce(sum(${modelProviderMappingHistory.clientErrorsCount}), 0)::int`,
+			gatewayErrorsCount: sql<number>`coalesce(sum(${modelProviderMappingHistory.gatewayErrorsCount}), 0)::int`,
+			upstreamErrorsCount: sql<number>`coalesce(sum(${modelProviderMappingHistory.upstreamErrorsCount}), 0)::int`,
+			completedCount: sql<number>`coalesce(sum(${modelProviderMappingHistory.completedCount}), 0)::int`,
+			lengthLimitCount: sql<number>`coalesce(sum(${modelProviderMappingHistory.lengthLimitCount}), 0)::int`,
+			contentFilterCount: sql<number>`coalesce(sum(${modelProviderMappingHistory.contentFilterCount}), 0)::int`,
+			toolCallsCount: sql<number>`coalesce(sum(${modelProviderMappingHistory.toolCallsCount}), 0)::int`,
+			canceledCount: sql<number>`coalesce(sum(${modelProviderMappingHistory.canceledCount}), 0)::int`,
+			unknownFinishCount: sql<number>`coalesce(sum(${modelProviderMappingHistory.unknownFinishCount}), 0)::int`,
+			cachedCount: sql<number>`coalesce(sum(${modelProviderMappingHistory.cachedCount}), 0)::int`,
+			totalInputTokens: sql<number>`coalesce(sum(${modelProviderMappingHistory.totalInputTokens}), 0)::bigint`,
+			totalOutputTokens: sql<number>`coalesce(sum(${modelProviderMappingHistory.totalOutputTokens}), 0)::bigint`,
+			totalTokens: sql<number>`coalesce(sum(${modelProviderMappingHistory.totalTokens}), 0)::bigint`,
+			totalReasoningTokens: sql<number>`coalesce(sum(${modelProviderMappingHistory.totalReasoningTokens}), 0)::bigint`,
+			totalCachedTokens: sql<number>`coalesce(sum(${modelProviderMappingHistory.totalCachedTokens}), 0)::bigint`,
+			totalDuration: sql<number>`coalesce(sum(${modelProviderMappingHistory.totalDuration}), 0)::int`,
+			totalTimeToFirstToken: sql<number>`coalesce(sum(${modelProviderMappingHistory.totalTimeToFirstToken}), 0)::int`,
+			totalTimeToFirstReasoningToken: sql<number>`coalesce(sum(${modelProviderMappingHistory.totalTimeToFirstReasoningToken}), 0)::int`,
+			timeToFirstTokenCount: sql<number>`coalesce(sum(${modelProviderMappingHistory.timeToFirstTokenCount}), 0)::int`,
+			timeToFirstReasoningTokenCount: sql<number>`coalesce(sum(${modelProviderMappingHistory.timeToFirstReasoningTokenCount}), 0)::int`,
+			totalCost: sql<number>`coalesce(sum(${modelProviderMappingHistory.totalCost}), 0)`,
+			totalInputCost: sql<number>`coalesce(sum(${modelProviderMappingHistory.totalInputCost}), 0)`,
+			totalOutputCost: sql<number>`coalesce(sum(${modelProviderMappingHistory.totalOutputCost}), 0)`,
+			totalCachedInputCost: sql<number>`coalesce(sum(${modelProviderMappingHistory.totalCachedInputCost}), 0)`,
+			serviceTierExplicitCount: sql<number>`coalesce(sum(${modelProviderMappingHistory.serviceTierExplicitCount}), 0)::int`,
+			serviceTierImplicitCount: sql<number>`coalesce(sum(${modelProviderMappingHistory.serviceTierImplicitCount}), 0)::int`,
+			serviceTierServedCount: sql<number>`coalesce(sum(${modelProviderMappingHistory.serviceTierServedCount}), 0)::int`,
+			serviceTierUnconfirmedCount: sql<number>`coalesce(sum(${modelProviderMappingHistory.serviceTierUnconfirmedCount}), 0)::int`,
+		})
+		.from(modelProviderMappingHistory)
+		.where(
+			and(
+				gte(modelProviderMappingHistory.minuteTimestamp, roundedHour),
+				lt(modelProviderMappingHistory.minuteTimestamp, hourEnd),
+			),
+		)
+		.groupBy(
+			modelProviderMappingHistory.modelProviderMappingId,
+			modelProviderMappingHistory.modelId,
+			modelProviderMappingHistory.providerId,
+		);
+
+	for (const row of hourlyStats) {
+		const { modelProviderMappingId, modelId, providerId, ...stats } = row;
+		await database
+			.insert(modelProviderMappingHistoryHourly)
+			.values({
+				modelProviderMappingId,
+				modelId,
+				providerId,
+				hourTimestamp: roundedHour,
+				...stats,
+			})
+			.onConflictDoUpdate({
+				target: [
+					modelProviderMappingHistoryHourly.modelProviderMappingId,
+					modelProviderMappingHistoryHourly.hourTimestamp,
+				],
+				set: { ...stats, updatedAt: new Date() },
+			});
+	}
+
+	return { totalMappings: hourlyStats.length };
+}
+
+/**
+ * Roll up a single hour of minute history into the hourly summary tables, plus
+ * the routing telemetry for that hour. Routing telemetry rides along here rather
+ * than on its own schedule so it is covered by the same backfill pass.
+ */
+async function calculateHistoryForHour(targetHour: Date) {
+	const mappingResult = await calculateMappingHistoryForHour(targetHour);
+	const modelResult = await calculateModelHistoryForHour(targetHour);
+	// Routing telemetry is diagnostic, and it reads `log` rather than the minute
+	// history the two rollups above are built from. A failure in it must not cost
+	// us the hour's usage and cost stats, so it is logged and skipped instead of
+	// propagating. The hour then stays absent from routing_election_hourly, which
+	// is exactly what makes the next backfill pass retry it.
+	let routingResult: Awaited<
+		ReturnType<typeof calculateRoutingTelemetryForHour>
+	> | null = null;
+	try {
+		routingResult = await calculateRoutingTelemetryForHour(targetHour);
+	} catch (error) {
+		logger.error(
+			`Error calculating routing telemetry for ${targetHour.toISOString()}:`,
+			error as Error,
+		);
+	}
+	return { mappingResult, modelResult, routingResult };
+}
+
+/**
+ * Calculate the hourly summary for the previous (now-complete) hour and refresh
+ * the current in-progress hour so dashboards see recent data without waiting for
+ * the hour to close. Called once per minutely tick.
+ */
+export async function calculateHourlyHistory() {
+	const currentHourStart = getCurrentHourStart();
+	const previousHourStart = new Date(currentHourStart.getTime() - ONE_HOUR_MS);
+
+	try {
+		await calculateHistoryForHour(previousHourStart);
+		await calculateHistoryForHour(currentHourStart);
+
+		logger.debug(
+			`Recorded hourly history for ${previousHourStart.toISOString()} and ${currentHourStart.toISOString()}`,
+		);
+	} catch (error) {
+		logger.error("Error calculating hourly history:", error as Error);
+		throw error;
+	}
+}
+
+/**
+ * Backfill missing hourly summary rows by walking every completed hour from the
+ * earliest minute-history entry up to the previous complete hour and recomputing
+ * only the hours absent from ANY summary table — the two history rollups, plus
+ * routing telemetry for hours whose logs still exist. Detecting missing hours
+ * (rather than resuming from the latest entry) is what makes this robust: the
+ * minutely loop writes the current and previous hour on startup, so the latest
+ * hourly entry is never a reliable "everything before this is done" watermark —
+ * resuming from it would strand the older gap. Recomputing any hour missing from
+ * one table also heals a table left behind by a partial write. The in-progress
+ * current hour is excluded (the live loop owns it).
+ */
+export async function backfillHourlyHistoryIfNeeded() {
+	logger.info("Checking for missing hourly history periods to backfill...");
+
+	try {
+		const database = db;
+
+		const currentHourStart = getCurrentHourStart();
+		const previousHourStart = new Date(
+			currentHourStart.getTime() - ONE_HOUR_MS,
+		);
+
+		// Earliest minute-history entry across both source tables — the oldest hour
+		// the hourly rollup could possibly cover.
+		const earliestMappingMinute = await database
+			.select({ minuteTimestamp: modelProviderMappingHistory.minuteTimestamp })
+			.from(modelProviderMappingHistory)
+			.orderBy(asc(modelProviderMappingHistory.minuteTimestamp))
+			.limit(1);
+
+		const earliestModelMinute = await database
+			.select({ minuteTimestamp: modelHistory.minuteTimestamp })
+			.from(modelHistory)
+			.orderBy(asc(modelHistory.minuteTimestamp))
+			.limit(1);
+
+		let earliestMinute: Date | null = null;
+		if (earliestMappingMinute.length > 0 && earliestModelMinute.length > 0) {
+			earliestMinute = new Date(
+				Math.min(
+					earliestMappingMinute[0]!.minuteTimestamp.getTime(),
+					earliestModelMinute[0]!.minuteTimestamp.getTime(),
+				),
+			);
+		} else if (earliestMappingMinute.length > 0) {
+			earliestMinute = earliestMappingMinute[0]!.minuteTimestamp;
+		} else if (earliestModelMinute.length > 0) {
+			earliestMinute = earliestModelMinute[0]!.minuteTimestamp;
+		}
+
+		if (!earliestMinute) {
+			logger.info("No minute history found. Skipping hourly backfill.");
+			return;
+		}
+
+		const startHour = roundToHourStart(earliestMinute);
+		if (startHour > previousHourStart) {
+			logger.info(
+				"Hourly history is up to date (no completed hours to roll up).",
+			);
+			return;
+		}
+
+		// Oldest hour that still has logs to aggregate. Routing telemetry is derived
+		// from `log` rather than from minute history, so hours whose logs retention
+		// has already pruned can never produce routing rows — requiring them below
+		// would recompute the same empty hours on every worker start.
+		const earliestLog = await database
+			.select({ createdAt: log.createdAt })
+			.from(log)
+			.orderBy(asc(log.createdAt))
+			.limit(1);
+		const earliestLogHourMs = earliestLog[0]
+			? roundToHourStart(earliestLog[0].createdAt).getTime()
+			: null;
+
+		// Hours already summarized in each table (excluding the in-progress current
+		// hour). An hour is recomputed only when it is missing from any set.
+		const [mappingHours, modelHours, routingHours] = await Promise.all([
+			database
+				.select({
+					hourTimestamp: modelProviderMappingHistoryHourly.hourTimestamp,
+				})
+				.from(modelProviderMappingHistoryHourly)
+				.where(
+					lt(modelProviderMappingHistoryHourly.hourTimestamp, currentHourStart),
+				),
+			database
+				.select({ hourTimestamp: modelHistoryHourly.hourTimestamp })
+				.from(modelHistoryHourly)
+				.where(lt(modelHistoryHourly.hourTimestamp, currentHourStart)),
+			database
+				.selectDistinct({ hourTimestamp: routingElectionHourly.hourTimestamp })
+				.from(routingElectionHourly)
+				.where(lt(routingElectionHourly.hourTimestamp, currentHourStart)),
+		]);
+
+		const mappingHourSet = new Set(
+			mappingHours.map((r) => r.hourTimestamp.getTime()),
+		);
+		const modelHourSet = new Set(
+			modelHours.map((r) => r.hourTimestamp.getTime()),
+		);
+		const routingHourSet = new Set(
+			routingHours.map((r) => r.hourTimestamp.getTime()),
+		);
+
+		logger.info(
+			`Backfilling missing hourly history from ${startHour.toISOString()} to ${previousHourStart.toISOString()}`,
+		);
+
+		let hour = startHour;
+		let scanned = 0;
+		let computed = 0;
+		while (
+			hour <= previousHourStart &&
+			scanned < HOURLY_BACKFILL_MAX_ITERATIONS
+		) {
+			const ms = hour.getTime();
+			// Routing telemetry shipped after the two history tables, so on the first
+			// pass after deploy every historical hour is present in those two and
+			// absent from routing — checking only them would leave routing telemetry
+			// permanently unbackfilled.
+			const routingMissing =
+				earliestLogHourMs !== null &&
+				ms >= earliestLogHourMs &&
+				!routingHourSet.has(ms);
+			if (!mappingHourSet.has(ms) || !modelHourSet.has(ms) || routingMissing) {
+				const result = await calculateHistoryForHour(hour);
+				logger.info(
+					`Backfilled hourly history for ${hour.toISOString()}: ${result.mappingResult.totalMappings} mappings, ${result.modelResult.totalModels} models, ${result.routingResult?.electionRows ?? 0} routing elections`,
+				);
+				computed++;
+			}
+
+			const nextHour = roundToHourStart(new Date(hour.getTime() + ONE_HOUR_MS));
+			if (nextHour.getTime() <= hour.getTime()) {
+				logger.error(
+					`Loop safety break: Time calculation error at ${hour.toISOString()}`,
+				);
+				break;
+			}
+
+			hour = nextHour;
+			scanned++;
+		}
+
+		if (scanned >= HOURLY_BACKFILL_MAX_ITERATIONS) {
+			logger.warn(
+				`Hourly backfill stopped at iteration limit ${HOURLY_BACKFILL_MAX_ITERATIONS} to prevent runaway backfill`,
+			);
+		}
+
+		logger.info(
+			`Hourly backfill complete: scanned ${scanned} hour(s), computed ${computed} missing.`,
+		);
+	} catch (error) {
+		logger.error("Error during hourly history backfill:", error as Error);
 		throw error;
 	}
 }

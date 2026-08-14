@@ -1,3 +1,5 @@
+import { redactedProviderErrorText } from "@/lib/stealth-provider-errors.js";
+
 import { extractErrorCause } from "./extract-error-cause.js";
 
 interface ErrorWithCode extends Error {
@@ -11,9 +13,27 @@ export interface NormalizeStreamingErrorOptions {
 	model: string;
 	bufferSnapshot?: string;
 	phase: "upstream_connect" | "upstream_read";
+	/**
+	 * When true, the client-facing payload is scrubbed of every raw upstream
+	 * detail so a stealth provider's identity cannot leak through a mid-stream
+	 * read fault. The raw error message, the undici `cause` chain (which can
+	 * embed the secret host via ENOTFOUND/ECONNREFUSED/TLS errors) and the
+	 * buffered upstream body are all dropped; only the gateway-derived status
+	 * survives. The internal `log` payload is never redacted — it feeds the
+	 * internal-only log columns, consistent with the sibling error branches
+	 * (chat.ts:8335 / chat.ts:9254) and redactErrorDetails.
+	 */
+	redact?: boolean;
 }
 
 export interface NormalizedStreamingError {
+	/**
+	 * True when the failure is an expected upstream-side disconnect (the provider
+	 * closed the socket mid-stream, e.g. "terminated: other side closed"), rather
+	 * than a gateway-side streaming read fault. Callers use this to avoid logging
+	 * the error at server-error severity and to classify it as an upstream error.
+	 */
+	terminated: boolean;
 	client: {
 		message: string;
 		type: "gateway_error";
@@ -23,7 +43,7 @@ export interface NormalizedStreamingError {
 		details: {
 			statusCode: number;
 			statusText: string;
-			errorName: string;
+			errorName?: string;
 			errorCode?: string;
 			cause?: string;
 		};
@@ -118,13 +138,20 @@ function safeStringifyError(error: unknown): string {
 	return `[unserializable ${ctorName}]`;
 }
 
-function isUpstreamTermination(error: unknown, cause?: string): boolean {
+/**
+ * True when the failure is an expected upstream-side socket close (the provider
+ * or client closed the connection mid-request, e.g. undici's
+ * "terminated: other side closed" / ECONNRESET), rather than a gateway bug.
+ * Callers use this to log such disconnects at warn severity instead of raising
+ * server-error alerts.
+ */
+export function isUpstreamTermination(error: unknown): boolean {
 	if (!(error instanceof Error)) {
 		return false;
 	}
 
 	const normalizedMessage = error.message.trim().toLowerCase();
-	const normalizedCause = cause?.toLowerCase() ?? "";
+	const normalizedCause = extractErrorCause(error)?.toLowerCase() ?? "";
 
 	return (
 		(error.name === "TypeError" && normalizedMessage === "terminated") ||
@@ -139,7 +166,7 @@ function isUpstreamTermination(error: unknown, cause?: string): boolean {
 export function normalizeStreamingError(
 	options: NormalizeStreamingErrorOptions,
 ): NormalizedStreamingError {
-	const { error, provider, model, bufferSnapshot, phase } = options;
+	const { error, provider, model, bufferSnapshot, phase, redact } = options;
 
 	const errorName =
 		error instanceof Error
@@ -152,7 +179,7 @@ export function normalizeStreamingError(
 	const cause = extractErrorCause(error);
 	const errorCode = getErrorCode(error);
 
-	const terminated = isUpstreamTermination(error, cause);
+	const terminated = isUpstreamTermination(error);
 	const statusCode = terminated ? 502 : 500;
 	const statusText = terminated
 		? "Upstream Stream Terminated"
@@ -162,21 +189,42 @@ export function normalizeStreamingError(
 		: `Streaming error: ${rawMessage}`;
 	const responseText = cause ? `${rawMessage} | cause: ${cause}` : rawMessage;
 
+	const client: NormalizedStreamingError["client"] = redact
+		? {
+				// Generic, status-only payload: no raw message, no cause chain,
+				// no buffered upstream body — none of which may reach a client
+				// for a stealth provider.
+				message: redactedProviderErrorText(statusCode),
+				type: "gateway_error",
+				param: null,
+				code: "streaming_error",
+				responseText: redactedProviderErrorText(statusCode),
+				// Status only: errorName / errorCode / cause are all dropped so a stealth
+				// provider's failure mode cannot be inferred client-side, matching
+				// redactErrorDetails on the sibling branches (chat.ts 8335 / 9254).
+				details: {
+					statusCode,
+					statusText,
+				},
+			}
+		: {
+				message,
+				type: "gateway_error",
+				param: null,
+				code: "streaming_error",
+				responseText: bufferSnapshot,
+				details: {
+					statusCode,
+					statusText,
+					errorName,
+					...(errorCode ? { errorCode } : {}),
+					...(cause ? { cause } : {}),
+				},
+			};
+
 	return {
-		client: {
-			message,
-			type: "gateway_error",
-			param: null,
-			code: "streaming_error",
-			responseText: bufferSnapshot,
-			details: {
-				statusCode,
-				statusText,
-				errorName,
-				...(errorCode ? { errorCode } : {}),
-				...(cause ? { cause } : {}),
-			},
-		},
+		terminated,
+		client,
 		log: {
 			message: rawMessage,
 			type: "streaming_error",

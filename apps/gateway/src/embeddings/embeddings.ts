@@ -5,7 +5,10 @@ import { buildRoutingAttempt } from "@/chat/tools/build-routing-attempt.js";
 import { createLogEntry } from "@/chat/tools/create-log-entry.js";
 import { extractCustomHeaders } from "@/chat/tools/extract-custom-headers.js";
 import { getFinishReasonFromError } from "@/chat/tools/get-finish-reason-from-error.js";
-import { getProviderEnv } from "@/chat/tools/get-provider-env.js";
+import {
+	getCredentialSetting,
+	resolvePlatformCredential,
+} from "@/chat/tools/resolve-platform-credential.js";
 import {
 	getErrorType,
 	isRetryableErrorType,
@@ -19,26 +22,48 @@ import {
 	reportTrackedKeyError,
 	reportTrackedKeySuccess,
 } from "@/lib/api-key-health.js";
-import { assertApiKeyWithinUsageLimits } from "@/lib/api-key-usage-limits.js";
+import {
+	assertApiKeyWithinUsageLimits,
+	assertMemberWithinBudget,
+} from "@/lib/api-key-usage-limits.js";
 import {
 	findApiKeyByToken,
 	findOrganizationById,
 	findProjectById,
 	findProviderKey,
 } from "@/lib/cached-queries.js";
+import { raceClientAbort } from "@/lib/client-abort.js";
 import { getClientIpFromRequest } from "@/lib/client-ip.js";
+import { assertProviderCompliant } from "@/lib/compliance.js";
+import {
+	applyEndUserSession,
+	assertTestWalletModelAllowed,
+} from "@/lib/end-user-session.js";
 import { extractApiToken } from "@/lib/extract-api-token.js";
 import { createFailedKeyTracker } from "@/lib/failed-key-tracker.js";
-import { throwIamException, validateModelAccess } from "@/lib/iam.js";
+import { throwIamException, validateRequestModelAccess } from "@/lib/iam.js";
 import { calculateDataStorageCost, insertLog } from "@/lib/logs.js";
+import {
+	clientFacingUpstreamFailureMessage,
+	redactedProviderErrorText,
+	shouldRedactProviderError,
+} from "@/lib/stealth-provider-errors.js";
 import { createCombinedSignal, isTimeoutError } from "@/lib/timeout-config.js";
 
-import { getProviderHeaders } from "@llmgateway/actions";
+import {
+	getProviderDefaultBaseUrl,
+	getProviderHeaders,
+	managedCredentialOptions,
+	providerKeyLabel,
+	readProviderKey,
+} from "@llmgateway/actions";
 import { shortid } from "@llmgateway/db";
 import { logger } from "@llmgateway/logger";
 import {
-	getProviderEnvValue,
+	getOrganizationEnvVariant,
 	models as modelDefinitions,
+	resolveVertexTokenType,
+	type VertexTokenType,
 } from "@llmgateway/models";
 
 import type { RoutingAttempt } from "@/chat/tools/retry-with-fallback.js";
@@ -46,6 +71,7 @@ import type { ServerTypes } from "@/vars.js";
 import type { RoutingMetadata } from "@llmgateway/actions";
 import type { InferSelectModel, tables } from "@llmgateway/db";
 import type { ModelDefinition, ProviderModelMapping } from "@llmgateway/models";
+import type { RoutingCredentialSource } from "@llmgateway/shared/routing-telemetry";
 
 const embeddingInputSchema = z
 	.union([
@@ -73,7 +99,7 @@ const embeddingRequestSchema = z.object({
 	}),
 	dimensions: z.number().int().positive().optional().openapi({
 		description:
-			"Number of dimensions for the output embeddings. Only supported on `text-embedding-3-*` models.",
+			"Number of dimensions for the output embeddings. Only supported by models that allow shortening output (e.g. `text-embedding-3-*`, `gemini-embedding-*`, `qwen3-embedding-8b`).",
 		example: 1536,
 	}),
 	user: z.string().optional().openapi({
@@ -223,7 +249,7 @@ function findEmbeddingMapping(modelId: string): {
 			if (requestedProvider && candidate.providerId !== requestedProvider) {
 				continue;
 			}
-			if (model.id === modelKey || candidate.externalId === modelKey) {
+			if (model.id === modelKey) {
 				return {
 					mapping: candidate,
 					modelDef: model,
@@ -245,10 +271,17 @@ function getAvailableCredits(
 			? parseFloat(organization.devPlanCreditsLimit ?? "0") -
 				parseFloat(organization.devPlanCreditsUsed ?? "0")
 			: 0;
+	const chatPlanCreditsRemaining =
+		organization.chatPlan !== "none"
+			? parseFloat(organization.chatPlanCreditsLimit ?? "0") -
+				parseFloat(organization.chatPlanCreditsUsed ?? "0")
+			: 0;
 
 	return {
 		devPlanCreditsRemaining,
-		totalAvailableCredits: regularCredits + devPlanCreditsRemaining,
+		chatPlanCreditsRemaining,
+		totalAvailableCredits:
+			regularCredits + devPlanCreditsRemaining + chatPlanCreditsRemaining,
 	};
 }
 
@@ -258,8 +291,11 @@ function assertCreditsAvailableForEmbedding(
 	insufficientCreditsMessage: string,
 	devPlanCreditLimitMessage: (renewalDate: string) => string,
 ) {
-	const { devPlanCreditsRemaining, totalAvailableCredits } =
-		getAvailableCredits(organization);
+	const {
+		devPlanCreditsRemaining,
+		chatPlanCreditsRemaining,
+		totalAvailableCredits,
+	} = getAvailableCredits(organization);
 
 	if (totalAvailableCredits > 0 || modelDef.free) {
 		return;
@@ -271,6 +307,15 @@ function assertCreditsAvailableForEmbedding(
 			: "your next billing date";
 		throw new HTTPException(402, {
 			message: devPlanCreditLimitMessage(renewalDate),
+		});
+	}
+
+	if (organization.chatPlan !== "none" && chatPlanCreditsRemaining <= 0) {
+		const renewalDate = organization.chatPlanExpiresAt
+			? new Date(organization.chatPlanExpiresAt).toLocaleDateString()
+			: "your next billing date";
+		throw new HTTPException(402, {
+			message: `Chat Plan credit limit reached. Upgrade your plan or wait for renewal on ${renewalDate}.`,
 		});
 	}
 
@@ -507,42 +552,69 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 	const token = extractApiToken(c);
 	const apiKey = await findApiKeyByToken(token);
 
-	if (!apiKey || apiKey.status !== "active") {
+	if (!apiKey) {
 		throw new HTTPException(401, {
 			message:
-				"Unauthorized: Invalid LLMGateway API token. Please make sure the token is not deleted or disabled. Go to the LLMGateway 'API Keys' page to generate a new token.",
+				"Unauthorized: Invalid LLMGateway API token. The token could not be found. Go to the LLMGateway 'API Keys' page to generate a new token.",
 		});
 	}
 
-	assertApiKeyWithinUsageLimits(apiKey);
+	if (apiKey.status !== "active") {
+		throw new HTTPException(401, {
+			message:
+				"Unauthorized: This LLMGateway API token is not active (it may be disabled or deleted). Go to the LLMGateway 'API Keys' page to generate a new token.",
+		});
+	}
 
-	const project = await findProjectById(apiKey.projectId);
-	if (!project) {
+	const baseProject = await findProjectById(apiKey.projectId);
+	if (!baseProject) {
 		throw new HTTPException(500, {
 			message: "Could not find project",
 		});
 	}
 
-	if (project.status === "deleted") {
+	if (baseProject.status === "deleted") {
 		throw new HTTPException(410, {
 			message: "Project has been archived and is no longer accessible",
 		});
 	}
 
-	const organization = await findOrganizationById(project.organizationId);
-	if (!organization) {
+	// User-level limits take priority: enforce the per-member budget (set on the
+	// Teams page; fails open on read errors) before the per-key usage limits, so a
+	// member who is over budget is denied even if the key itself is within limits.
+	await assertMemberWithinBudget(apiKey.createdBy, baseProject.organizationId);
+	assertApiKeyWithinUsageLimits(apiKey);
+
+	const baseOrganization = await findOrganizationById(
+		baseProject.organizationId,
+	);
+	if (!baseOrganization) {
 		throw new HTTPException(500, {
 			message: "Could not find organization",
 		});
 	}
 
-	if (organization.status === "deleted") {
+	if (baseOrganization.status === "deleted") {
 		throw new HTTPException(410, {
 			message: "Organization has been disabled and is no longer accessible",
 		});
 	}
 
-	if (organization.isPersonal && organization.devPlan !== "none") {
+	// LLM SDK: ephemeral end-user sessions bill the bound wallet instead
+	// of the developer's org credits (the log's endCustomerWalletId redirects the
+	// worker's debit). For normal keys this is a no-op.
+	const { project, organization, wallet } = await applyEndUserSession(
+		c,
+		apiKey,
+		baseProject,
+		baseOrganization,
+	);
+
+	// Sandbox wallets can only spend on free models (none for embeddings today),
+	// so this rejects paid embedding requests from test-mode end-user sessions.
+	assertTestWalletModelAllowed(wallet, modelDef);
+
+	if (organization.kind === "devpass" && organization.devPlan !== "none") {
 		throw new HTTPException(403, {
 			message:
 				"Embeddings are not available for coding plans. Coding plans only include text-based inference.",
@@ -550,16 +622,28 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 	}
 
 	const retentionLevel = organization.retentionLevel ?? "none";
-	const iamValidation = await validateModelAccess(
-		apiKey.id,
-		modelDefId,
-		providerId,
-		modelDef,
-		getClientIpFromRequest(c),
-	);
+
+	const iamValidation = await validateRequestModelAccess({
+		apiKey,
+		organizationId: project.organizationId,
+		requestedModel: modelDefId,
+		requestedProvider: providerId,
+		activeModelInfo: modelDef,
+		clientIp: getClientIpFromRequest(c),
+	});
 	if (!iamValidation.allowed) {
 		throwIamException(iamValidation.reason ?? "Model access denied");
 	}
+
+	// Enterprise provider compliance policy: embeddings resolve to a single
+	// provider, so block the request before any data is sent if that provider
+	// doesn't meet the org's required certifications/data policies.
+	await assertProviderCompliant(organization, providerId, {
+		organizationId: project.organizationId,
+		modelId: modelDefId,
+		apiKeyId: apiKey.id,
+		model: requestedModel,
+	});
 
 	const finalLogId = shortid();
 	const failedKeys = createFailedKeyTracker();
@@ -574,11 +658,20 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 	const routingAttempts: RoutingAttempt[] = [];
 	const buildEmbeddingRoutingMetadata = (
 		usedApiKeyHash: string | undefined,
+		usedCredentialSource: RoutingCredentialSource,
+		usedProviderKey: { id?: string; label?: string },
 	): RoutingMetadata => ({
 		availableProviders: [providerId],
 		selectedProvider: providerId,
 		selectionReason,
-		...(usedApiKeyHash ? { usedApiKeyHash } : {}),
+		...(usedApiKeyHash
+			? {
+					usedApiKeyHash,
+					usedCredentialSource,
+					usedProviderKeyId: usedProviderKey.id,
+					usedProviderKeyLabel: usedProviderKey.label,
+				}
+			: {}),
 		providerScores: [],
 		...(routingAttempts.length > 0 ? { routing: routingAttempts } : {}),
 	});
@@ -590,8 +683,13 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 	};
 	const retryOrganization = organization;
 
+	// Which env-var variant (`__ENTERPRISE` / `__PLANS` overrides) applies to
+	// this org's env-credential reads. Undefined = base vars only.
+	const envVariant = getOrganizationEnvVariant(retryOrganization);
+
 	const isGoogleAiStudio = providerId === "google-ai-studio";
 	const isGoogleVertex = providerId === "google-vertex";
+	const isDeepInfra = providerId === "deepinfra";
 	const googleInputs: string[] =
 		isGoogleAiStudio || isGoogleVertex
 			? Array.isArray(input)
@@ -599,19 +697,16 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 				: [input as string]
 			: [];
 
-	const providerBaseUrlDefaults: Partial<Record<string, string>> = {
-		openai: "https://api.openai.com",
-		"google-ai-studio": "https://generativelanguage.googleapis.com",
-		"google-vertex": "https://aiplatform.googleapis.com",
-	};
-
 	interface EmbeddingAttempt {
 		providerKey: InferSelectModel<typeof tables.providerKey> | undefined;
+		/** Platform-managed credential when one served this attempt. */
+		managedKey: InferSelectModel<typeof tables.providerKey> | undefined;
 		usedToken: string;
 		configIndex: number;
 		envVarName: string | undefined;
 		upstreamUrl: string;
 		requestBody: Record<string, unknown>;
+		vertexTokenType?: VertexTokenType;
 	}
 
 	type ResolveResult =
@@ -628,6 +723,7 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 	// id, batch_not_supported) return as `json_error` for direct `c.json`.
 	async function resolveAttempt(): Promise<ResolveResult> {
 		let providerKey: InferSelectModel<typeof tables.providerKey> | undefined;
+		let managedKey: InferSelectModel<typeof tables.providerKey> | undefined;
 		let usedToken: string | undefined;
 		let configIndex = 0;
 		let envVarName: string | undefined;
@@ -653,7 +749,7 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 					message: `No API key set for provider: ${providerId}. Please add a provider key in your settings or add credits and switch to credits or hybrid mode.`,
 				});
 			}
-			usedToken = providerKey.token;
+			usedToken = readProviderKey(providerKey);
 		} else if (retryProject.mode === "credits") {
 			assertCreditsAvailableForEmbedding(
 				retryOrganization,
@@ -663,13 +759,18 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 					`Dev Plan credit limit reached. Upgrade your plan or wait for renewal on ${renewalDate}.`,
 			);
 
-			const envResult = getProviderEnv(providerId, {
+			const platformCredential = await resolvePlatformCredential(providerId, {
 				selectionScope: upstreamModel,
-				excludedIndices: excludedEnvKeyIndices,
+				variant: envVariant,
+				region: undefined,
+				requiresServiceTier: false,
+				excludedEnvIndices: excludedEnvKeyIndices,
+				excludedProviderKeyIds,
 			});
-			usedToken = envResult.token;
-			configIndex = envResult.configIndex;
-			envVarName = envResult.envVarName;
+			managedKey = platformCredential.managedKey;
+			usedToken = platformCredential.token;
+			configIndex = platformCredential.configIndex;
+			envVarName = platformCredential.envVarName;
 		} else if (retryProject.mode === "hybrid") {
 			providerKey = await findProviderKey(
 				retryProject.organizationId,
@@ -678,7 +779,7 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 				excludedProviderKeyIds,
 			);
 			if (providerKey) {
-				usedToken = providerKey.token;
+				usedToken = readProviderKey(providerKey);
 			} else {
 				assertCreditsAvailableForEmbedding(
 					retryOrganization,
@@ -688,13 +789,18 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 						`No API key set for provider. Dev Plan credit limit reached. Upgrade your plan or wait for renewal on ${renewalDate}.`,
 				);
 
-				const envResult = getProviderEnv(providerId, {
+				const platformCredential = await resolvePlatformCredential(providerId, {
 					selectionScope: upstreamModel,
-					excludedIndices: excludedEnvKeyIndices,
+					variant: envVariant,
+					region: undefined,
+					requiresServiceTier: false,
+					excludedEnvIndices: excludedEnvKeyIndices,
+					excludedProviderKeyIds,
 				});
-				usedToken = envResult.token;
-				configIndex = envResult.configIndex;
-				envVarName = envResult.envVarName;
+				managedKey = platformCredential.managedKey;
+				usedToken = platformCredential.token;
+				configIndex = platformCredential.configIndex;
+				envVarName = platformCredential.envVarName;
 			}
 		} else {
 			throw new HTTPException(400, {
@@ -725,15 +831,19 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 		// that don't declare a baseUrl env in packages/models/src/providers.ts,
 		// so the ?? chain falls through safely. providerKey.baseUrl still wins
 		// when set, so BYOK callers can opt out by configuring their own.
-		const envBaseUrl = getProviderEnvValue(providerId, "baseUrl", configIndex);
+		const envBaseUrl = getCredentialSetting(providerId, "baseUrl", managedKey, {
+			configIndex,
+			variant: envVariant,
+		});
 		const resolvedBaseUrl =
 			providerKey?.baseUrl ??
 			envBaseUrl ??
-			providerBaseUrlDefaults[providerId] ??
+			getProviderDefaultBaseUrl(providerId) ??
 			"https://api.openai.com";
 
 		let upstreamUrl: string;
 		let requestBody: Record<string, unknown>;
+		let vertexTokenType: VertexTokenType | undefined;
 
 		if (isGoogleAiStudio) {
 			const endpoint =
@@ -783,7 +893,10 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 			}
 			const vertexProjectId =
 				providerKey?.options?.google_vertex_project_id ??
-				getProviderEnvValue("google-vertex", "project", configIndex);
+				getCredentialSetting("google-vertex", "project", managedKey, {
+					configIndex,
+					variant: envVariant,
+				});
 			if (!vertexProjectId) {
 				return {
 					kind: "json_error",
@@ -800,15 +913,53 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 				};
 			}
 			const vertexRegion =
-				getProviderEnvValue("google-vertex", "region", configIndex, "global") ??
-				"global";
+				getCredentialSetting("google-vertex", "region", managedKey, {
+					configIndex,
+					defaultValue: "global",
+					variant: envVariant,
+				}) ?? "global";
 
-			upstreamUrl = `${resolvedBaseUrl}/v1/projects/${vertexProjectId}/locations/${vertexRegion}/publishers/google/models/${upstreamModel}:predict?key=${encodeURIComponent(usedToken)}`;
+			// OAuth tokens are sent via the Authorization header (below); only API
+			// keys go in the `?key=` query param. Resolve once so the header and
+			// the query param agree. No region-env override here, so providerKey
+			// presence is an accurate BYOK signal.
+			vertexTokenType = resolveVertexTokenType(
+				"google-vertex",
+				providerKey
+					? (providerKey.options ?? undefined)
+					: managedCredentialOptions(managedKey),
+				configIndex,
+				providerKey !== undefined || managedKey !== undefined,
+				envVariant,
+			);
+			const vertexAuthQuery =
+				vertexTokenType === "oauth"
+					? ""
+					: `?key=${encodeURIComponent(usedToken)}`;
+			upstreamUrl = `${resolvedBaseUrl}/v1/projects/${vertexProjectId}/locations/${vertexRegion}/publishers/google/models/${upstreamModel}:predict${vertexAuthQuery}`;
 			requestBody = {
 				instances: googleInputs.map((text) => ({ content: text })),
 			};
 			if (dimensions !== undefined) {
 				requestBody.parameters = { outputDimensionality: dimensions };
+			}
+		} else if (isDeepInfra) {
+			// DeepInfra's base URL is https://api.deepinfra.com/v1/openai so the
+			// embeddings path is /embeddings (not /v1/embeddings, which would
+			// double up to /v1/openai/v1/embeddings and 404).
+			upstreamUrl = `${resolvedBaseUrl}/embeddings`;
+			requestBody = {
+				input,
+				model: upstreamModel,
+			};
+			if (encoding_format !== undefined) {
+				requestBody.encoding_format = encoding_format;
+			}
+			if (dimensions !== undefined) {
+				requestBody.dimensions = dimensions;
+			}
+			if (user !== undefined) {
+				requestBody.user = user;
 			}
 		} else {
 			upstreamUrl = `${resolvedBaseUrl}/v1/embeddings`;
@@ -831,11 +982,13 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 			kind: "ok",
 			attempt: {
 				providerKey,
+				managedKey,
 				usedToken,
 				configIndex,
 				envVarName,
 				upstreamUrl,
 				requestBody,
+				vertexTokenType,
 			},
 		};
 	}
@@ -850,7 +1003,8 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 		failedKeys.remember(providerId, undefined, {
 			envVarName: failedAttempt.envVarName,
 			configIndex: failedAttempt.configIndex,
-			providerKeyId: failedAttempt.providerKey?.id,
+			providerKeyId:
+				failedAttempt.providerKey?.id ?? failedAttempt.managedKey?.id,
 		});
 		try {
 			const next = await resolveAttempt();
@@ -888,11 +1042,24 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 		while (true) {
 			const attemptLogId = shortid();
 			const usedApiKeyHash = getApiKeyFingerprint(attempt.usedToken);
+			// BYOK only when the organization's own key served the attempt; a
+			// platform-managed credential is LLM Gateway's key and bills as credits.
+			const credentialSource: RoutingCredentialSource = attempt.providerKey
+				? "byok"
+				: "platform";
+			// Named only for the organization's own key; providerKeyLabel()
+			// refuses to describe a platform-managed credential.
+			const providerKeyId = attempt.providerKey?.id;
+			const keyLabel = providerKeyLabel(attempt.providerKey);
+			const usedProviderKey = { id: providerKeyId, label: keyLabel };
 			const baseLogEntry = createLogEntry({
 				requestId,
 				project,
 				apiKey,
-				providerKeyId: attempt.providerKey?.id,
+				// BYOK only: a managed credential is the platform's own key and its
+				// traffic must still bill as credits.
+				organizationProviderKeyId: attempt.providerKey?.id,
+				usedProviderKeyId: attempt.providerKey?.id ?? attempt.managedKey?.id,
 				usedModel: `${providerId}/${modelDefId}`,
 				usedModelMapping: upstreamModel,
 				usedProvider: providerId,
@@ -900,6 +1067,7 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 				requestedProvider: providerId,
 				messages: normalizedMessages,
 				source,
+				apiOrigin: "embeddings",
 				customHeaders,
 				debugMode,
 				userAgent,
@@ -908,21 +1076,42 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 			});
 
 			let upstreamResponse: Response;
+			let upstreamText = "";
 			let fetchError: Error | null = null;
 			try {
 				const fetchSignal = createCombinedSignal(controller);
 				upstreamResponse = await fetch(attempt.upstreamUrl, {
 					method: "POST",
+					// SSRF: never follow redirects on an authenticated provider request. A
+					// tenant-supplied baseUrl could 3xx to an internal host at request
+					// time, and a redirect would also leak the upstream token.
+					redirect: "error",
 					headers: {
 						"Content-Type": "application/json",
-						...getProviderHeaders(providerId, attempt.usedToken, { requestId }),
+						...getProviderHeaders(providerId, attempt.usedToken, {
+							requestId,
+							tokenType: attempt.vertexTokenType,
+						}),
 					},
 					body: JSON.stringify(attempt.requestBody),
 					signal: fetchSignal,
 				});
+				// Settle the body read immediately on a client disconnect instead of
+				// relying on the fetch AbortSignal to propagate into undici's
+				// in-flight body machinery, where a late abort can be missed.
+				upstreamText = await raceClientAbort(
+					upstreamResponse.text(),
+					c.req.raw.signal,
+					controller,
+				);
 			} catch (error) {
+				// The abort can also surface as a generic failure (undici
+				// "terminated" TypeError, or a TimeoutError when the abort never
+				// reached the read), so any failure after the client already
+				// disconnected counts as canceled too.
 				const isCanceled =
-					error instanceof Error && error.name === "AbortError";
+					error instanceof Error &&
+					(error.name === "AbortError" || c.req.raw.signal.aborted);
 				const isTimeout = isTimeoutError(error);
 				const isNetworkError = error instanceof TypeError;
 				if (!isCanceled && !isTimeout && !isNetworkError) {
@@ -933,7 +1122,8 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 			}
 
 			if (fetchError !== null) {
-				const isCanceled = fetchError.name === "AbortError";
+				const isCanceled =
+					fetchError.name === "AbortError" || c.req.raw.signal.aborted;
 				const isTimeout = isTimeoutError(fetchError);
 
 				const duration = Date.now() - startedAt;
@@ -946,9 +1136,11 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 						upstreamModel,
 					);
 				}
-				if (attempt.providerKey?.id) {
+				const trackedKeyHealthId =
+					attempt.providerKey?.id ?? attempt.managedKey?.id;
+				if (trackedKeyHealthId) {
 					reportTrackedKeyError(
-						attempt.providerKey.id,
+						trackedKeyHealthId,
 						0,
 						undefined,
 						upstreamModel,
@@ -974,63 +1166,73 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 							false,
 							{
 								apiKeyHash: usedApiKeyHash,
+								credentialSource,
+								providerKeyId,
+								providerKeyLabel: keyLabel,
 								logId: willRetry ? attemptLogId : finalLogId,
 							},
 						),
 					);
 				}
 
-				await insertLog({
-					...baseLogEntry,
-					id: willRetry ? attemptLogId : finalLogId,
-					routingMetadata: buildEmbeddingRoutingMetadata(usedApiKeyHash),
-					duration,
-					timeToFirstToken: null,
-					timeToFirstReasoningToken: null,
-					responseSize: 0,
-					content: null,
-					reasoningContent: null,
-					finishReason: isCanceled ? "canceled" : "upstream_error",
-					promptTokens: null,
-					completionTokens: null,
-					totalTokens: null,
-					reasoningTokens: null,
-					cachedTokens: null,
-					hasError: !isCanceled,
-					streamed: false,
-					canceled: isCanceled,
-					errorDetails: isCanceled
-						? null
-						: {
-								statusCode: 0,
-								statusText: fetchError.name,
-								responseText: fetchError.message,
-							},
-					inputCost: 0,
-					outputCost: 0,
-					cachedInputCost: 0,
-					requestCost: 0,
-					webSearchCost: 0,
-					imageInputTokens: null,
-					imageOutputTokens: null,
-					imageInputCost: null,
-					imageOutputCost: null,
-					cost: 0,
-					estimatedCost: false,
-					discount: null,
-					pricingTier: null,
-					dataStorageCost: calculateDataStorageCost(
-						null,
-						null,
-						null,
-						null,
-						retentionLevel,
-					),
-					cached: false,
-					toolResults: null,
-					retried: willRetry,
-					retriedByLogId: willRetry ? finalLogId : null,
-				});
+				await insertLog(
+					{
+						...baseLogEntry,
+						id: willRetry ? attemptLogId : finalLogId,
+						routingMetadata: buildEmbeddingRoutingMetadata(
+							usedApiKeyHash,
+							credentialSource,
+							usedProviderKey,
+						),
+						duration,
+						timeToFirstToken: null,
+						timeToFirstReasoningToken: null,
+						responseSize: 0,
+						content: null,
+						reasoningContent: null,
+						finishReason: isCanceled ? "canceled" : "upstream_error",
+						promptTokens: null,
+						completionTokens: null,
+						totalTokens: null,
+						reasoningTokens: null,
+						cachedTokens: null,
+						hasError: !isCanceled,
+						streamed: false,
+						canceled: isCanceled,
+						errorDetails: isCanceled
+							? null
+							: {
+									statusCode: 0,
+									statusText: fetchError.name,
+									responseText: fetchError.message,
+								},
+						inputCost: 0,
+						outputCost: 0,
+						cachedInputCost: 0,
+						requestCost: 0,
+						webSearchCost: 0,
+						imageInputTokens: null,
+						imageOutputTokens: null,
+						imageInputCost: null,
+						imageOutputCost: null,
+						cost: 0,
+						estimatedCost: false,
+						discount: null,
+						pricingTier: null,
+						dataStorageCost: calculateDataStorageCost(
+							null,
+							null,
+							null,
+							null,
+							retentionLevel,
+						),
+						cached: false,
+						toolResults: null,
+						retried: willRetry,
+						retriedByLogId: willRetry ? finalLogId : null,
+					},
+					{ retentionLevel },
+				);
 
 				if (willRetry && nextAttempt) {
 					attempt = nextAttempt;
@@ -1054,9 +1256,13 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 				return c.json(
 					{
 						error: {
-							message: isTimeout
-								? `Upstream provider timeout: ${fetchError.message}`
-								: `Failed to connect to provider: ${fetchError.message}`,
+							message: clientFacingUpstreamFailureMessage(
+								providerId,
+								isTimeout
+									? "Upstream provider timeout"
+									: "Failed to connect to provider",
+								fetchError.message,
+							),
 							type: isTimeout ? "upstream_timeout" : "upstream_error",
 							param: null,
 							code: isTimeout ? "timeout" : "fetch_failed",
@@ -1066,7 +1272,6 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 				);
 			}
 
-			const upstreamText = await upstreamResponse.text();
 			const duration = Date.now() - startedAt;
 			const responseSize = upstreamText.length;
 
@@ -1090,9 +1295,11 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 						upstreamModel,
 					);
 				}
-				if (attempt.providerKey?.id) {
+				const trackedKeyHealthId =
+					attempt.providerKey?.id ?? attempt.managedKey?.id;
+				if (trackedKeyHealthId) {
 					reportTrackedKeyError(
-						attempt.providerKey.id,
+						trackedKeyHealthId,
 						status,
 						upstreamText,
 						upstreamModel,
@@ -1118,64 +1325,90 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 						false,
 						{
 							apiKeyHash: usedApiKeyHash,
+							credentialSource,
+							providerKeyId,
+							providerKeyLabel: keyLabel,
 							logId: willRetry ? attemptLogId : finalLogId,
 						},
 					),
 				);
 
-				await insertLog({
-					...baseLogEntry,
-					id: willRetry ? attemptLogId : finalLogId,
-					routingMetadata: buildEmbeddingRoutingMetadata(usedApiKeyHash),
-					duration,
-					timeToFirstToken: null,
-					timeToFirstReasoningToken: null,
-					responseSize,
-					content: getResponseContent(upstreamJson),
-					reasoningContent: null,
-					finishReason,
-					promptTokens: null,
-					completionTokens: null,
-					totalTokens: null,
-					reasoningTokens: null,
-					cachedTokens: null,
-					hasError: true,
-					streamed: false,
-					canceled: false,
-					errorDetails: {
-						statusCode: status,
-						statusText: upstreamResponse.statusText,
-						responseText: upstreamText,
+				await insertLog(
+					{
+						...baseLogEntry,
+						id: willRetry ? attemptLogId : finalLogId,
+						routingMetadata: buildEmbeddingRoutingMetadata(
+							usedApiKeyHash,
+							credentialSource,
+							usedProviderKey,
+						),
+						duration,
+						timeToFirstToken: null,
+						timeToFirstReasoningToken: null,
+						responseSize,
+						content: getResponseContent(upstreamJson),
+						reasoningContent: null,
+						finishReason,
+						promptTokens: null,
+						completionTokens: null,
+						totalTokens: null,
+						reasoningTokens: null,
+						cachedTokens: null,
+						hasError: true,
+						streamed: false,
+						canceled: false,
+						errorDetails: {
+							statusCode: status,
+							statusText: upstreamResponse.statusText,
+							responseText: upstreamText,
+						},
+						inputCost: 0,
+						outputCost: 0,
+						cachedInputCost: 0,
+						requestCost: 0,
+						webSearchCost: 0,
+						imageInputTokens: null,
+						imageOutputTokens: null,
+						imageInputCost: null,
+						imageOutputCost: null,
+						cost: 0,
+						estimatedCost: false,
+						discount: null,
+						pricingTier: null,
+						dataStorageCost: calculateDataStorageCost(
+							null,
+							null,
+							null,
+							null,
+							retentionLevel,
+						),
+						cached: false,
+						toolResults: null,
+						retried: willRetry,
+						retriedByLogId: willRetry ? finalLogId : null,
 					},
-					inputCost: 0,
-					outputCost: 0,
-					cachedInputCost: 0,
-					requestCost: 0,
-					webSearchCost: 0,
-					imageInputTokens: null,
-					imageOutputTokens: null,
-					imageInputCost: null,
-					imageOutputCost: null,
-					cost: 0,
-					estimatedCost: false,
-					discount: null,
-					pricingTier: null,
-					dataStorageCost: calculateDataStorageCost(
-						null,
-						null,
-						null,
-						null,
-						retentionLevel,
-					),
-					cached: false,
-					toolResults: null,
-					retried: willRetry,
-					retriedByLogId: willRetry ? finalLogId : null,
-				});
+					{ retentionLevel },
+				);
 
 				if (willRetry && nextAttempt) {
 					attempt = nextAttempt;
 					continue;
+				}
+
+				// Stealth providers: never pass the raw upstream error body through
+				// to the client — only the upstream status code may be surfaced.
+				if (shouldRedactProviderError(providerId)) {
+					return c.json(
+						{
+							error: {
+								message: redactedProviderErrorText(status),
+								type: "upstream_error",
+								param: null,
+								code: "upstream_error",
+							},
+						} satisfies z.infer<typeof embeddingErrorSchema>,
+						status as 400 | 401 | 403 | 404 | 410 | 429 | 500 | 502 | 503 | 504,
+					);
 				}
 
 				const normalizedUpstreamError: z.infer<typeof embeddingErrorSchema> = {
@@ -1205,8 +1438,10 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 					upstreamModel,
 				);
 			}
-			if (attempt.providerKey?.id) {
-				reportTrackedKeySuccess(attempt.providerKey.id, upstreamModel);
+			const trackedKeyHealthId =
+				attempt.providerKey?.id ?? attempt.managedKey?.id;
+			if (trackedKeyHealthId) {
+				reportTrackedKeySuccess(trackedKeyHealthId, upstreamModel);
 			}
 
 			let normalizedResponse: Record<string, unknown> = (upstreamJson ??
@@ -1331,8 +1566,7 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 					typeof upstreamJson === "object" &&
 					"usage" in (upstreamJson as Record<string, unknown>)
 						? ((upstreamJson as Record<string, unknown>).usage as
-								| Record<string, unknown>
-								| undefined)
+								Record<string, unknown> | undefined)
 						: undefined;
 				const promptTokensRaw = usage?.prompt_tokens;
 				const totalTokensRaw = usage?.total_tokens;
@@ -1363,54 +1597,64 @@ embeddings.openapi(createEmbeddings, async (c): Promise<any> => {
 					true,
 					{
 						apiKeyHash: usedApiKeyHash,
+						credentialSource,
+						providerKeyId,
+						providerKeyLabel: keyLabel,
 						logId: finalLogId,
 					},
 				),
 			);
 
-			await insertLog({
-				...baseLogEntry,
-				id: finalLogId,
-				routingMetadata: buildEmbeddingRoutingMetadata(usedApiKeyHash),
-				duration,
-				timeToFirstToken: null,
-				timeToFirstReasoningToken: null,
-				responseSize,
-				content: getResponseContent(normalizedResponse),
-				reasoningContent: null,
-				finishReason: "stop",
-				promptTokens: promptTokens !== null ? promptTokens.toString() : null,
-				completionTokens: null,
-				totalTokens: totalTokens !== null ? totalTokens.toString() : null,
-				reasoningTokens: null,
-				cachedTokens: null,
-				hasError: false,
-				streamed: false,
-				canceled: false,
-				errorDetails: null,
-				inputCost,
-				outputCost: 0,
-				cachedInputCost: 0,
-				requestCost,
-				webSearchCost: 0,
-				imageInputTokens: null,
-				imageOutputTokens: null,
-				imageInputCost: null,
-				imageOutputCost: null,
-				cost,
-				estimatedCost: estimatedUsage,
-				discount: null,
-				pricingTier: null,
-				dataStorageCost: calculateDataStorageCost(
-					promptTokens,
-					null,
-					null,
-					null,
-					retentionLevel,
-				),
-				cached: false,
-				toolResults: null,
-			});
+			await insertLog(
+				{
+					...baseLogEntry,
+					id: finalLogId,
+					routingMetadata: buildEmbeddingRoutingMetadata(
+						usedApiKeyHash,
+						credentialSource,
+						usedProviderKey,
+					),
+					duration,
+					timeToFirstToken: null,
+					timeToFirstReasoningToken: null,
+					responseSize,
+					content: getResponseContent(normalizedResponse),
+					reasoningContent: null,
+					finishReason: "stop",
+					promptTokens: promptTokens !== null ? promptTokens.toString() : null,
+					completionTokens: null,
+					totalTokens: totalTokens !== null ? totalTokens.toString() : null,
+					reasoningTokens: null,
+					cachedTokens: null,
+					hasError: false,
+					streamed: false,
+					canceled: false,
+					errorDetails: null,
+					inputCost,
+					outputCost: 0,
+					cachedInputCost: 0,
+					requestCost,
+					webSearchCost: 0,
+					imageInputTokens: null,
+					imageOutputTokens: null,
+					imageInputCost: null,
+					imageOutputCost: null,
+					cost,
+					estimatedCost: estimatedUsage,
+					discount: null,
+					pricingTier: null,
+					dataStorageCost: calculateDataStorageCost(
+						promptTokens,
+						null,
+						null,
+						null,
+						retentionLevel,
+					),
+					cached: false,
+					toolResults: null,
+				},
+				{ retentionLevel },
+			);
 
 			return c.json(normalizedResponse);
 		}

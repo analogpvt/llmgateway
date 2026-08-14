@@ -1,4 +1,35 @@
 export {
+	CLAW_FORK_PATTERN,
+	CODING_AGENTS,
+	detectCodingAgentFromReferer,
+	detectCodingAgentFromTitle,
+	getSupportedAgentsList,
+	isRecognizedCodingAgent,
+	normalizeSourceToAgentId,
+	type CodingAgentDefinition,
+} from "./coding-agents.js";
+
+export {
+	type CodingModel,
+	type CodingModelMapping,
+	isCodingModel,
+	mappingSupportsCoding,
+	providerSupportsCachedInput,
+} from "./coding-models.js";
+
+export {
+	AGENT_LOG_CSV_HEADERS,
+	type AgentCsvLog,
+	buildAgentLogsCsv,
+	buildCsv,
+	type CsvFormat,
+	DEFAULT_CSV_FORMAT,
+	detectCsvFormat,
+	escapeCsvValue,
+	formatCsvNumber,
+} from "./csv.js";
+
+export {
 	AUTO_TOP_UP_DEFAULT_AMOUNT,
 	AUTO_TOP_UP_DEFAULT_THRESHOLD,
 	calculateFees,
@@ -11,14 +42,58 @@ export {
 } from "./fees.js";
 
 export {
-	DEV_PLAN_ANNUAL_DISCOUNT_MONTHS,
+	DEV_PLAN_INCLUDED_RESET_PASSES,
+	DEV_PLAN_PREMIUM_WEEK_LENGTH_MS,
+	DEV_PLAN_PREMIUM_WEEKLY_PERCENT,
 	DEV_PLAN_PRICES,
+	DEV_PLAN_RESET_PASS_PRICES,
+	DEV_PLAN_RESET_PASS_PURCHASE_MAX_CYCLE_USAGE,
+	DEV_PLAN_RESET_PASS_REDEEM_MAX_CYCLE_USAGE,
 	type DevPlanCycle,
 	type DevPlanTier,
-	getDevPlanAnnualMonthlyPrice,
-	getDevPlanAnnualPrice,
 	getDevPlanCreditsLimit,
+	getDevPlanCycleUsageFraction,
+	getDevPlanPremiumWeeklyLimit,
+	getDevPlanUpgradeCredits,
+	getIncludedResetPassesRemaining,
+	getRemainingPremiumWeeklyAllowance,
+	isPremiumWeekExpired,
 } from "./dev-plans.js";
+
+export {
+	REFUND_COMMENTS_MAX_LENGTH,
+	REFUND_REASON_ASSURANCE,
+	REFUND_REASON_HEADING,
+	REFUND_REASON_OPTIONS,
+	REFUND_REASONS,
+	isRefundFeedbackComplete,
+	refundCommentsRequired,
+	type RefundReason,
+	type RefundReasonOption,
+} from "./refunds.js";
+
+export {
+	CHAT_PLAN_PRICES,
+	CHAT_PLAN_STARTER_BLOCKED_MODEL_PATTERNS,
+	type ChatPlanCycle,
+	type ChatPlanTier,
+	type ChatPlanMessageEstimate,
+	CHAT_PLAN_CREDITS_MULTIPLIERS,
+	estimateChatPlanMessages,
+	getChatPlanCreditsLimit,
+	getChatPlanCreditsMultiplier,
+	getChatPlanCreditsMultipliers,
+	isChatPlanModelAllowed,
+} from "./chat-plans.js";
+
+export {
+	getModelCategory,
+	HIGH_COST_INPUT_PRICE,
+	HIGH_COST_OUTPUT_PRICE,
+	isPremiumModel,
+	isPremiumUsedModel,
+	type ModelCategory,
+} from "./model-categories.js";
 
 export {
 	HealthChecker,
@@ -63,8 +138,84 @@ export {
 export { selectLoadBalancedItem } from "./load-balance.js";
 
 export {
+	fillRandomFloats,
+	randomFloat,
+	randomFloatBetween,
+	randomInt,
+	randomItem,
+	randomToken,
+	uniqueId,
+} from "./random.js";
+
+export {
+	getModelIdsByProvider,
+	getProviderModelIds,
+} from "./provider-model-ids.js";
+
+export {
+	addCalendarDays,
+	ENTERPRISE_TRIAL_DAY_PRESETS,
+	ENTERPRISE_TRIAL_DAYS,
+	extendTrialEnd,
+	formatPlanTermBadge,
+	formatPlanTermLabel,
+	getOrganizationTerm,
+	getPlanTerm,
+	PLAN_TERM_CRITICAL_DAYS,
+	PLAN_TERM_EXPIRING_DAYS,
+	TRIAL_EXTENSION_DAY_PRESETS,
+	TRIAL_TERM_CRITICAL_DAYS,
+	TRIAL_TERM_EXPIRING_DAYS,
+	type PlanTerm,
+	type PlanTermStatus,
+	type PlanTermThresholds,
+} from "./plan-term.js";
+
+export {
+	isLoungeSource,
+	LEGACY_LOUNGE_SOURCE,
+	LOUNGE_SOURCE,
+} from "./lounge-source.js";
+
+export { MARKETING_STATS, RUNWARE_PROMO } from "./marketing.js";
+
+export {
+	ONBOARDING_MODEL,
+	ONBOARDING_MAX_TOKENS,
+	ONBOARDING_MAX_PROMPT_CHARS,
+	ONBOARDING_SPONSOR_HEADER,
+	getOnboardingSponsorSecret,
+} from "./onboarding.js";
+
+export { isContentFilterErrorText } from "./content-filter.js";
+
+export { FAILURE_LABELS, failureLabel } from "./compliance-failure-labels.js";
+
+export {
+	MAX_BULK_BLOCK_ORGANIZATIONS,
+	MIN_BULK_BLOCK_SEARCH_LENGTH,
+} from "./bulk-block.js";
+
+export {
+	CUSTOM_PROVIDER_NAME_MESSAGE,
+	CUSTOM_PROVIDER_NAME_REGEX,
+	RESERVED_CUSTOM_PROVIDER_NAME_MESSAGE,
+	RESERVED_CUSTOM_PROVIDER_NAMES,
+} from "./custom-providers.js";
+
+export {
+	validateApiKeyLimitsWithinMemberBudget,
+	SSO_TEAM_DEFAULT_DEVELOPER_BUDGET,
+	type ApiKeyLimitConstraints,
+	type ApiKeyPeriodDurationUnitValue,
+	type MemberBudgetOwner,
+	type MemberBudgetShape,
+} from "./member-budget-limits.js";
+
+export {
 	estimateChatMessageTokens,
 	estimateTokensFromText,
+	type TokenEstimateFallback,
 } from "./token-estimate.js";
 
 export {
@@ -92,5 +243,40 @@ export {
 	type RoutingTimeoutsConfig,
 	type RoutingWeightsConfig,
 } from "./routing-config.js";
+
+export {
+	isRoutingCredentialSource,
+	isRoutingExclusionReason,
+	isRoutingSelectionReason,
+	ROUTING_CREDENTIAL_SOURCE_DESCRIPTIONS,
+	ROUTING_CREDENTIAL_SOURCE_LABELS,
+	ROUTING_EXCLUSION_REASON_LABELS,
+	ROUTING_EXCLUSION_REASON_MESSAGES,
+	ROUTING_EXCLUSION_REASONS,
+	ROUTING_SELECTION_KIND_LABELS,
+	ROUTING_SELECTION_KINDS,
+	ROUTING_SELECTION_REASON_LABELS,
+	ROUTING_SELECTION_REASONS,
+	routingExclusionReasonMessage,
+	routingSelectionKind,
+	type RoutingCredentialSource,
+	type RoutingExclusionReason,
+	type RoutingSelectionKind,
+	type RoutingSelectionReason,
+	type ServiceTierMode,
+	toRoutingCredentialSource,
+	toRoutingExclusionReason,
+	toRoutingSelectionReason,
+} from "./routing-telemetry.js";
+
+export {
+	assertSafeContentUrl,
+	assertSafeProviderBaseUrl,
+	assertSafeWebhookUrl,
+	isPrivateOrReservedIp,
+	isProviderUrlGuardEnabled,
+} from "./url-safety.js";
+
+export { parseUsedModel, regionFromUsedModel } from "./used-model.js";
 
 export * from "./components/ui/index.js";

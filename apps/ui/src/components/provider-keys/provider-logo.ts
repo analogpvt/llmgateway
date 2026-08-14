@@ -5,10 +5,13 @@ import type { ProviderId } from "@llmgateway/models";
 export const providerLogoUrls: Partial<
 	Record<ProviderId, React.FC<React.SVGProps<SVGSVGElement>>>
 > = {
+	atlascloud: ProviderIcons.atlascloud,
 	openai: ProviderIcons.openai,
 	anthropic: ProviderIcons.anthropic,
+	elevenlabs: ProviderIcons.elevenlabs,
 	"google-ai-studio": ProviderIcons["google-ai-studio"],
 	glacier: ProviderIcons.glacier,
+	iceberg: ProviderIcons.iceberg,
 	"google-vertex": ProviderIcons["google-vertex"],
 	"vertex-anthropic": ProviderIcons["vertex-anthropic"],
 	"vertex-openai": ProviderIcons["vertex-openai"],
@@ -20,6 +23,7 @@ export const providerLogoUrls: Partial<
 	xai: ProviderIcons.xai,
 	deepseek: ProviderIcons.deepseek,
 	perplexity: ProviderIcons.perplexity,
+	meta: ProviderIcons.meta,
 	moonshot: ProviderIcons.moonshot,
 	novita: ProviderIcons.novita,
 	alibaba: ProviderIcons.alibaba,
@@ -36,6 +40,14 @@ export const providerLogoUrls: Partial<
 	xiaomi: ProviderIcons.xiaomi,
 	embercloud: ProviderIcons.embercloud,
 	deepinfra: ProviderIcons.deepinfra,
+	reve: ProviderIcons.reve,
+	sakana: ProviderIcons.sakana,
+	"scx-ai": ProviderIcons["scx-ai"],
+	"scx-ai-gp": ProviderIcons["scx-ai-gp"],
+	gonka24: ProviderIcons.gonka24,
+	fireworks: ProviderIcons.fireworks,
+	runware: ProviderIcons.runware,
+	ranoai: ProviderIcons.ranoai,
 };
 
 export const getProviderLogoDarkModeClasses = () => {

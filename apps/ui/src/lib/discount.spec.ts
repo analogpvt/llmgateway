@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { models } from "@llmgateway/models";
+import { models, type ProviderModelMapping } from "@llmgateway/models";
 
 import {
 	applyDiscount,
@@ -11,7 +11,9 @@ import {
 } from "./discount";
 
 const qwen = models.find((m) => m.id === "qwen3.7-max")!;
-const alibaba = qwen.providers.find((p) => p.providerId === "alibaba")!;
+const alibaba = qwen.providers.find(
+	(p) => p.providerId === "alibaba",
+)! as ProviderModelMapping;
 const novita = qwen.providers.find((p) => p.providerId === "novita")!;
 
 // Mocked global 50% discount on qwen3.7-max, as configured in the admin
@@ -39,7 +41,45 @@ describe("model-detail discounts", () => {
 		expect(
 			getEffectiveProviderDiscount(discounts, "alibaba", "qwen3.7-max"),
 		).toBe("0.5");
-		expect(getBestDiscount(discounts, "qwen3.7-max")).toEqual(fiftyPercentOff);
+		expect(getBestDiscount(discounts, "qwen3.7-max", ["alibaba"])).toEqual(
+			fiftyPercentOff,
+		);
+	});
+
+	it("picks the highest effective discount across the model's providers", () => {
+		const providerWide: DiscountData = {
+			...fiftyPercentOff,
+			id: "provider-wide",
+			provider: "novita",
+			model: null,
+			discountPercent: "0.3",
+		};
+		const modelSpecific: DiscountData = {
+			...fiftyPercentOff,
+			id: "model-specific",
+			provider: "alibaba",
+			discountPercent: "0.2",
+		};
+
+		expect(
+			getBestDiscount([modelSpecific, providerWide], "qwen3.7-max", [
+				"alibaba",
+				"novita",
+			]),
+		).toEqual(providerWide);
+	});
+
+	it("ignores discounts that only apply to providers that were filtered out", () => {
+		const novitaOnly: DiscountData = {
+			...fiftyPercentOff,
+			provider: "novita",
+			model: null,
+		};
+
+		expect(
+			getBestDiscount([novitaOnly], "qwen3.7-max", ["alibaba"]),
+		).toBeNull();
+		expect(getBestDiscount([novitaOnly], "qwen3.7-max", [])).toBeNull();
 	});
 
 	it("applies the 50% discount to all per-million token prices", () => {
@@ -80,7 +120,9 @@ describe("model-detail discounts", () => {
 		expect(
 			getEffectiveProviderDiscount([byExternalId], "alibaba", "qwen3.7-max"),
 		).toBeUndefined();
-		expect(getBestDiscount([byExternalId], "qwen3.7-max")).toBeNull();
+		expect(
+			getBestDiscount([byExternalId], "qwen3.7-max", ["alibaba"]),
+		).toBeNull();
 	});
 
 	it("returns base prices when no discount is active", () => {
@@ -101,7 +143,7 @@ describe("model-detail discounts", () => {
 			expect(
 				getEffectiveProviderDiscount(discounts, "alibaba", "qwen3.7-max"),
 			).toBeUndefined();
-			expect(getBestDiscount(discounts, "qwen3.7-max")).toBeNull();
+			expect(getBestDiscount(discounts, "qwen3.7-max", ["alibaba"])).toBeNull();
 
 			expect(
 				applyDiscount(perMillion(alibaba.inputPrice)!, discountPercent),

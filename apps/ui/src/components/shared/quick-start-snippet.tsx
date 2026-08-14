@@ -14,7 +14,9 @@ export function QuickStartSection({
 	apiKey?: string;
 	onCopy?: () => void;
 }) {
-	const [activeTab, setActiveTab] = useState<"curl" | "typescript">("curl");
+	const [activeTab, setActiveTab] = useState<
+		"curl" | "typescript" | "python" | "ai-sdk"
+	>("curl");
 
 	const keyPlaceholder = apiKey ?? "YOUR_API_KEY";
 
@@ -23,7 +25,6 @@ export function QuickStartSection({
   -H "Authorization: Bearer ${keyPlaceholder}" \\
   -d '{
   "model": "auto",
-  "free_models_only": true,
   "messages": [
     {"role": "user", "content": "Hello!"}
   ]
@@ -39,11 +40,40 @@ const client = new OpenAI({
 const response = await client.chat.completions.create({
   model: "auto",
   messages: [{ role: "user", content: "Hello!" }],
-  // @ts-expect-error LLM Gateway extension
-  free_models_only: true,
 });`;
 
-	const code = activeTab === "curl" ? curlExample : tsExample;
+	const pythonExample = `from openai import OpenAI
+
+client = OpenAI(
+    api_key="${keyPlaceholder}",
+    base_url="https://api.llmgateway.io/v1/",
+)
+
+response = client.chat.completions.create(
+    model="auto",
+    messages=[{"role": "user", "content": "Hello!"}],
+)`;
+
+	const aiSdkExample = `import { createLLMGateway } from "@llmgateway/ai-sdk-provider";
+import { generateText } from "ai";
+
+const llmgateway = createLLMGateway({
+  apiKey: "${keyPlaceholder}",
+});
+
+const { text } = await generateText({
+  model: llmgateway("auto"),
+  prompt: "Hello!",
+});`;
+
+	const code =
+		activeTab === "curl"
+			? curlExample
+			: activeTab === "typescript"
+				? tsExample
+				: activeTab === "python"
+					? pythonExample
+					: aiSdkExample;
 
 	function copyCode() {
 		void navigator.clipboard.writeText(code);
@@ -64,7 +94,8 @@ const response = await client.chat.completions.create({
 					</div>
 					<p className="text-sm text-muted-foreground">
 						Use your API key to make requests. LLM Gateway is compatible with
-						the OpenAI SDK — just change the base URL.
+						the OpenAI SDK — just change the base URL — or use our dedicated AI
+						SDK provider.
 					</p>
 					<div className="flex gap-2">
 						<Button
@@ -82,6 +113,22 @@ const response = await client.chat.completions.create({
 							type="button"
 						>
 							TypeScript
+						</Button>
+						<Button
+							variant={activeTab === "python" ? "default" : "outline"}
+							size="sm"
+							onClick={() => setActiveTab("python")}
+							type="button"
+						>
+							Python
+						</Button>
+						<Button
+							variant={activeTab === "ai-sdk" ? "default" : "outline"}
+							size="sm"
+							onClick={() => setActiveTab("ai-sdk")}
+							type="button"
+						>
+							AI SDK
 						</Button>
 					</div>
 					<div className="relative rounded-md border bg-muted/50">

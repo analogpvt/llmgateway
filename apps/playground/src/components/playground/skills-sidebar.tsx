@@ -4,25 +4,21 @@ import { useQueryClient } from "@tanstack/react-query";
 import {
 	ChevronDown,
 	ChevronUp,
+	CreditCard,
 	ExternalLink,
-	Film,
-	ImagePlus,
 	LogOut,
-	MessageSquare,
-	PenTool,
 	Plus,
 	ScrollTextIcon,
+	Sparkles,
 	UploadIcon,
-	Users,
 	FileTextIcon,
 } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useTheme } from "next-themes";
-import { useCallback } from "react";
 
 import { CreditsDisplay } from "@/components/credits/credits-display";
 import { ThemeToggle } from "@/components/landing/theme-toggle";
+import { SidebarLoungePoints } from "@/components/lounge/sidebar-points";
 import { Button } from "@/components/ui/button";
 import {
 	DropdownMenu,
@@ -31,7 +27,6 @@ import {
 	DropdownMenuSeparator,
 	DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import { Logo } from "@/components/ui/logo";
 import {
 	Sidebar,
 	SidebarContent,
@@ -42,12 +37,19 @@ import {
 	SidebarMenuItem,
 	useSidebar,
 } from "@/components/ui/sidebar";
+import { Wordmark } from "@/components/ui/wordmark";
 import { useUser } from "@/hooks/useUser";
 import { clearLastUsedProjectCookiesAction } from "@/lib/actions/project";
 import { useAuth } from "@/lib/auth-client";
 import { cn } from "@/lib/utils";
 
 import { ChatSidebarSkeleton } from "./chat-sidebar-skeleton";
+import {
+	SidebarChatSearch,
+	SidebarShortcutKbd,
+	useSidebarShortcut,
+} from "./sidebar-actions";
+import { StudioNav } from "./studio-nav";
 
 import type { Skill } from "@/hooks/useSkills";
 import type { Organization } from "@/lib/types";
@@ -58,6 +60,7 @@ interface SkillsSidebarProps {
 	onSelectSkill: (skillId: string) => void;
 	isLoading?: boolean;
 	onCreateOpen: () => void;
+	onGenerateOpen: () => void;
 	onUploadOpen: () => void;
 	selectedOrganization: Organization | null;
 	className?: string;
@@ -69,6 +72,7 @@ export function SkillsSidebar({
 	onSelectSkill,
 	isLoading,
 	onCreateOpen,
+	onGenerateOpen,
 	onUploadOpen,
 	selectedOrganization,
 	className,
@@ -78,12 +82,8 @@ export function SkillsSidebar({
 	const { state: sidebarState, isMobile } = useSidebar();
 	const { user, isLoading: isUserLoading } = useUser();
 	const { signOut } = useAuth();
-	const { theme, setTheme, systemTheme } = useTheme();
 
-	const currentTheme = theme === "system" ? systemTheme : theme;
-	const toggleTheme = useCallback(() => {
-		setTheme(currentTheme === "dark" ? "light" : "dark");
-	}, [currentTheme, setTheme]);
+	const isMac = useSidebarShortcut("j", onCreateOpen);
 
 	const logout = async () => {
 		try {
@@ -98,7 +98,7 @@ export function SkillsSidebar({
 					router.push(
 						process.env.NODE_ENV === "development"
 							? "http://localhost:3003/login"
-							: "https://chat.llmgateway.io/login",
+							: "https://lounge.llmgateway.io/login",
 					);
 				},
 			},
@@ -121,8 +121,7 @@ export function SkillsSidebar({
 							className="flex self-start items-center gap-2 my-2"
 							prefetch={true}
 						>
-							<Logo className="size-6" />
-							<h1 className="text-xl font-semibold">LLM Gateway</h1>
+							<Wordmark />
 						</Link>
 						<div className="w-full rounded-md border p-4 text-sm">
 							<div className="font-medium mb-2">Sign in required</div>
@@ -136,6 +135,7 @@ export function SkillsSidebar({
 							</div>
 						</div>
 					</div>
+					<StudioNav />
 				</SidebarHeader>
 			</Sidebar>
 		);
@@ -146,17 +146,13 @@ export function SkillsSidebar({
 			<SidebarHeader>
 				<SidebarMenu>
 					<SidebarMenuItem>
-						<SidebarMenuButton size="lg" asChild tooltip="LLM Gateway">
+						<SidebarMenuButton size="lg" asChild tooltip="Lounge">
 							<Link href="/" prefetch={true}>
-								<div className="flex aspect-square size-8 items-center justify-center">
-									<Logo className="size-6" />
-								</div>
-								<span className="text-lg font-bold tracking-tight">
-									LLM Gateway
-								</span>
+								<Wordmark size="sm" iconBox />
 							</Link>
 						</SidebarMenuButton>
 					</SidebarMenuItem>
+					<SidebarChatSearch disabled />
 					<SidebarMenuItem>
 						<DropdownMenu>
 							<DropdownMenuTrigger asChild>
@@ -166,6 +162,7 @@ export function SkillsSidebar({
 								>
 									<Plus className="h-4 w-4" />
 									<span>New Skill</span>
+									<SidebarShortcutKbd keys={isMac ? "⌘J" : "Alt+J"} />
 									<ChevronDown className="ml-auto h-3 w-3 text-muted-foreground" />
 								</SidebarMenuButton>
 							</DropdownMenuTrigger>
@@ -174,6 +171,10 @@ export function SkillsSidebar({
 									<FileTextIcon className="mr-2 h-4 w-4" />
 									Write skill
 								</DropdownMenuItem>
+								<DropdownMenuItem onClick={onGenerateOpen}>
+									<Sparkles className="mr-2 h-4 w-4" />
+									Generate with AI
+								</DropdownMenuItem>
 								<DropdownMenuItem onClick={onUploadOpen}>
 									<UploadIcon className="mr-2 h-4 w-4" />
 									Upload a skill
@@ -181,47 +182,8 @@ export function SkillsSidebar({
 							</DropdownMenuContent>
 						</DropdownMenu>
 					</SidebarMenuItem>
-					<SidebarMenuItem>
-						<SidebarMenuButton asChild tooltip="Chat">
-							<Link href="/">
-								<MessageSquare className="h-4 w-4" />
-								<span>Chat</span>
-							</Link>
-						</SidebarMenuButton>
-					</SidebarMenuItem>
-					<SidebarMenuItem>
-						<SidebarMenuButton asChild tooltip="Group Chat">
-							<Link href="/group">
-								<Users className="h-4 w-4" />
-								<span>Group Chat</span>
-							</Link>
-						</SidebarMenuButton>
-					</SidebarMenuItem>
-					<SidebarMenuItem>
-						<SidebarMenuButton asChild tooltip="Image Studio">
-							<Link href="/image">
-								<ImagePlus className="h-4 w-4" />
-								<span>Image Studio</span>
-							</Link>
-						</SidebarMenuButton>
-					</SidebarMenuItem>
-					<SidebarMenuItem>
-						<SidebarMenuButton asChild tooltip="Video Studio">
-							<Link href="/video">
-								<Film className="h-4 w-4" />
-								<span>Video Studio</span>
-							</Link>
-						</SidebarMenuButton>
-					</SidebarMenuItem>
-					<SidebarMenuItem>
-						<SidebarMenuButton asChild tooltip="Canvas">
-							<Link href="/canvas">
-								<PenTool className="h-4 w-4" />
-								<span>Canvas</span>
-							</Link>
-						</SidebarMenuButton>
-					</SidebarMenuItem>
 				</SidebarMenu>
+				<StudioNav />
 			</SidebarHeader>
 
 			<SidebarContent className="overflow-hidden pb-2">
@@ -275,6 +237,7 @@ export function SkillsSidebar({
 			</SidebarContent>
 
 			<SidebarFooter>
+				<SidebarLoungePoints />
 				<div className="group-data-[collapsible=icon]:hidden">
 					<CreditsDisplay
 						organization={selectedOrganization}
@@ -316,6 +279,13 @@ export function SkillsSidebar({
 								sideOffset={4}
 							>
 								<DropdownMenuItem asChild>
+									<Link href="/pricing" prefetch={true}>
+										<CreditCard className="mr-2 h-4 w-4" />
+										Membership &amp; Billing
+									</Link>
+								</DropdownMenuItem>
+								<DropdownMenuSeparator />
+								<DropdownMenuItem asChild>
 									<a
 										href={
 											process.env.NODE_ENV === "development"
@@ -332,10 +302,7 @@ export function SkillsSidebar({
 								<DropdownMenuSeparator />
 								<DropdownMenuItem
 									className="justify-between gap-3"
-									onSelect={(event) => {
-										event.preventDefault();
-										toggleTheme();
-									}}
+									onSelect={(event) => event.preventDefault()}
 								>
 									<span>Theme</span>
 									<div

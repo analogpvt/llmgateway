@@ -1,7 +1,8 @@
 import { serve } from "@hono/node-server";
 
-import { redisClient } from "@llmgateway/cache";
-import { closeDatabase } from "@llmgateway/db";
+import { startProviderEnvInventoryPublisher } from "@llmgateway/actions";
+import { redisClient, storageRedisClient } from "@llmgateway/cache";
+import { closeDatabase, setQueryTags } from "@llmgateway/db";
 import {
 	initializeInstrumentation,
 	shutdownInstrumentation,
@@ -9,21 +10,51 @@ import {
 import { logger, toError } from "@llmgateway/logger";
 
 import { app } from "./app.js";
+import {
+	closeUpstreamDispatcher,
+	installUpstreamDispatcher,
+} from "./lib/upstream-dispatcher.js";
+import { metricsApp } from "./metrics-app.js";
+import { posthog } from "./posthog.js";
+import { attachRealtimeServer } from "./realtime/server.js";
 
+import type { RealtimeServer } from "./realtime/server.js";
 import type { ServerType } from "@hono/node-server";
 import type { NodeSDK } from "@opentelemetry/sdk-node";
 import type { Server } from "node:http";
 
-const port = Number(process.env.PORT) || 4001;
+// GATEWAY_PORT wins over PORT so a local worktree can pin gateway and api to
+// different ports from one shared shell env (both services read PORT).
+// Deployments only ever set PORT, so they are unaffected.
+const port = Number(process.env.GATEWAY_PORT || process.env.PORT) || 4001;
+
+// The Prometheus metrics endpoint is served on a separate port so it can be
+// exposed only internally (via the cluster network / Service) and never through
+// the public gateway ingress.
+const metricsPort = Number(process.env.METRICS_PORT) || 9090;
 
 // GCP Load Balancer has a fixed 600s keepalive timeout. Node.js default is 5s.
 // If Node closes the connection first, the LB sends requests on stale connections → 502.
 // Default to 620s (above GCP's 600s) to ensure the LB closes first.
 const keepAliveTimeoutS = Number(process.env.KEEP_ALIVE_TIMEOUT_S) || 620;
 
+// Host the /v1/realtime WebSocket proxy inside this process, so realtime
+// sessions are served on the gateway port with no extra deployment to operate.
+// Opt-in because a process that mints client secrets without an attached
+// listener would hand out credentials for a path nothing serves.
+const realtimeInline = process.env.REALTIME_INLINE === "true";
+
 let sdk: NodeSDK | null = null;
+let metricsServer: ServerType | null = null;
+let realtime: RealtimeServer | null = null;
+let stopEnvInventoryPublisher: (() => void) | null = null;
 
 async function startServer() {
+	// Tag every DB query with the originating service for Cloud SQL Query Insights
+	setQueryTags({ application: "gateway" });
+
+	installUpstreamDispatcher();
+
 	// Initialize tracing for gateway service
 	try {
 		sdk = initializeInstrumentation({
@@ -35,12 +66,32 @@ async function startServer() {
 		// Continue without tracing
 	}
 
+	// Serve Prometheus metrics on a separate, internal-only port.
+	logger.info("Metrics server starting", { port: metricsPort });
+	metricsServer = serve({
+		port: metricsPort,
+		fetch: metricsApp.fetch,
+	});
+
 	logger.info("Server starting", { port });
 
-	return serve({
+	const server = serve({
 		port,
 		fetch: app.fetch,
 	});
+
+	if (realtimeInline) {
+		realtime = attachRealtimeServer(server as Server);
+		logger.info("Realtime WebSocket proxy attached inline", { port });
+	}
+
+	// Publish which LLM_* API keys this process holds (masked and fingerprinted,
+	// never the tokens) so the admin dashboard lists the keys actually serving
+	// traffic. The API is a separate deployment and generally has no provider
+	// keys of its own to report.
+	stopEnvInventoryPublisher = startProviderEnvInventoryPublisher();
+
+	return server;
 }
 
 let isShuttingDown = false;
@@ -51,6 +102,17 @@ let isShuttingDown = false;
 // terminationGracePeriodSeconds (minus any preStop sleep).
 const shutdownGracePeriodMs =
 	Number(process.env.SHUTDOWN_GRACE_PERIOD_MS) || 1200000;
+
+// Realtime sessions are long-lived WebSockets rather than request/response, so
+// closeServer()'s idle-connection draining never retires them: a live call is
+// "idle" between audio frames. They get their own explicit drain, bounded by
+// the session-duration cap plus a minute so a rolling deploy converges even if
+// a session runs to its limit. Must stay <= the pod's
+// terminationGracePeriodSeconds, or the orchestrator SIGKILLs mid-call and the
+// wait accomplishes nothing.
+const realtimeShutdownGracePeriodMs =
+	Number(process.env.REALTIME_SHUTDOWN_GRACE_PERIOD_MS) ||
+	((Number(process.env.REALTIME_MAX_SESSION_SECONDS) || 3600) + 60) * 1000;
 
 const closeServer = (server: ServerType): Promise<void> => {
 	return new Promise((resolve, reject) => {
@@ -97,18 +159,71 @@ const gracefulShutdown = async (signal: string, server: ServerType) => {
 		signal,
 	});
 
+	// Stop refreshing before the Redis connection closes below; the snapshot
+	// expires on its own once no gateway is publishing.
+	stopEnvInventoryPublisher?.();
+	stopEnvInventoryPublisher = null;
+
 	try {
+		// Stop accepting new realtime sessions, then let the live calls hang up
+		// on their own rather than cutting them off mid-conversation. This runs
+		// before closeServer() because the WebSockets would otherwise keep the
+		// HTTP server open past its own grace period anyway.
+		if (realtime) {
+			logger.info("Draining realtime sessions", {
+				activeSessions: realtime.sessionCount(),
+				gracePeriodMs: realtimeShutdownGracePeriodMs,
+			});
+			realtime.stopAccepting();
+
+			const deadline = Date.now() + realtimeShutdownGracePeriodMs;
+			while (realtime.sessionCount() > 0 && Date.now() < deadline) {
+				await new Promise((resolve) => setTimeout(resolve, 1000));
+			}
+
+			if (realtime.sessionCount() > 0) {
+				logger.warn("Force-closing remaining realtime sessions", {
+					remaining: realtime.sessionCount(),
+				});
+				realtime.closeAll(1001, "server_shutdown");
+				// Session finalization and its final billing writes are
+				// fire-and-forget; let them flush before closeDatabase() below.
+				await new Promise((resolve) => setTimeout(resolve, 2000));
+			}
+			logger.info("Realtime sessions drained");
+		}
+
 		logger.info("Closing HTTP server");
 		await closeServer(server);
 		logger.info("HTTP server closed");
+
+		if (metricsServer) {
+			logger.info("Closing metrics server");
+			await closeServer(metricsServer);
+			logger.info("Metrics server closed");
+		}
+
+		logger.info("Closing upstream dispatcher");
+		await closeUpstreamDispatcher();
+
+		// Flush batched analytics before the process winds down — posthog-node
+		// buffers events (~10s), and a redeploy would otherwise drop the tail.
+		// Guarded: a telemetry flush failure must not abort the shutdown.
+		try {
+			await posthog.shutdown();
+		} catch (error) {
+			logger.warn("PostHog flush failed during shutdown", {
+				error: String(error),
+			});
+		}
 
 		logger.info("Closing database connection");
 		await closeDatabase();
 		logger.info("Database connection closed");
 
-		logger.info("Closing Redis connection");
-		await redisClient.quit();
-		logger.info("Redis connection closed");
+		logger.info("Closing Redis connections");
+		await Promise.all([redisClient.quit(), storageRedisClient.quit()]);
+		logger.info("Redis connections closed");
 
 		// Shutdown instrumentation last to ensure all spans are flushed
 		if (sdk) {

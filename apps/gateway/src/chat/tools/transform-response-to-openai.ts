@@ -1,3 +1,8 @@
+import { redisClient } from "@llmgateway/cache";
+import { shortid } from "@llmgateway/db";
+import { logger } from "@llmgateway/logger";
+
+import { dedupeGoogleCandidateParts } from "./google-candidates.js";
 import { mapFinishReasonToOpenai } from "./map-finish-reason-to-openai.js";
 import { formatUsedModelForDisplay } from "./resolve-provider-context.js";
 
@@ -25,6 +30,24 @@ export interface ResponseMetadataExtras {
 	organizationId?: string;
 	projectId?: string;
 	discount?: number | null;
+	/**
+	 * The Flex/Priority tier the caller requested. When set, both
+	 * `requested_service_tier` and `used_service_tier` are surfaced in the
+	 * response metadata (and the streaming final usage chunk). Null/undefined for
+	 * standard requests, which omit the fields entirely.
+	 */
+	requestedServiceTier?: "flex" | "priority" | null;
+	/**
+	 * The tier actually served upstream (null when downgraded to standard).
+	 * Surfaced on its own even without a requested tier, so a tier applied by
+	 * an org-level default (e.g. the DevPass flex setting) stays visible.
+	 */
+	usedServiceTier?: "flex" | "priority" | null;
+	/**
+	 * True when the body is a gateway response-cache replay rather than a fresh
+	 * upstream call. Only emitted on hits, so a missing key means "not cached".
+	 */
+	cached?: boolean;
 }
 
 export function toResponseMetadataExtras(
@@ -41,7 +64,45 @@ export function toResponseMetadataExtras(
 			: {}),
 		...(extras.projectId ? { project_id: extras.projectId } : {}),
 		discount: extras.discount ?? null,
+		...(extras.requestedServiceTier
+			? { requested_service_tier: extras.requestedServiceTier }
+			: {}),
+		...(extras.requestedServiceTier || extras.usedServiceTier
+			? { used_service_tier: extras.usedServiceTier ?? null }
+			: {}),
+		...(extras.cached ? { cached: true } : {}),
 	};
+}
+
+/**
+ * Zero the cost fields of a gateway response-cache replay.
+ *
+ * A cache hit never reaches a provider, so it is free — but the stored body
+ * still carries the cost of the original (uncached) call, which made replays
+ * report a full charge to the caller. Token counts are left untouched: they
+ * still describe the completion being returned and are what the log row keeps
+ * for analytics.
+ */
+export function zeroCostsOnCachedResponseUsage(
+	usage: Record<string, unknown> | undefined | null,
+): Record<string, unknown> | undefined | null {
+	if (!usage || typeof usage !== "object") {
+		return usage;
+	}
+
+	const next: Record<string, unknown> = { ...usage };
+	if (typeof next.cost === "number") {
+		next.cost = 0;
+	}
+	const costDetails = next.cost_details;
+	if (costDetails && typeof costDetails === "object") {
+		next.cost_details = Object.fromEntries(
+			Object.entries(costDetails as Record<string, unknown>).map(
+				([key, value]) => [key, typeof value === "number" ? 0 : value],
+			),
+		);
+	}
+	return next;
 }
 
 export function applyExtendedUsageFields(
@@ -358,14 +419,136 @@ export function transformResponseToOpenai(
 	cacheCreation5mTokens: number | null = null,
 	cacheCreation1hTokens: number | null = null,
 	audioInputTokens: number | null = null,
+	serviceTier?: string,
 ) {
 	let transformedResponse = json;
 
 	switch (usedProvider) {
 		case "google-ai-studio":
 		case "glacier":
+		case "iceberg":
 		case "google-vertex":
 		case "quartz": {
+			// Multi-candidate responses (n > 1 via candidateCount) map each Google
+			// candidate to its own OpenAI choice. The pre-parsed content/reasoning
+			// arguments aggregate every candidate for the log row, so re-extract
+			// per-candidate output from the (de-duplicated) raw parts here. The
+			// single-candidate path keeps using the pre-parsed values, which also
+			// carry response healing and image-generation labels.
+			const googleCandidates = dedupeGoogleCandidateParts(
+				Array.isArray(json?.candidates) ? json.candidates : [],
+				usedProvider,
+			);
+			const googleChoices =
+				googleCandidates.length > 1
+					? googleCandidates.map((candidate: any, position: number) => {
+							const candidateParts = candidate?.content?.parts ?? [];
+							const candidateContent = candidateParts
+								.filter((part: any) => !part.thought)
+								.map((part: any) => part.text)
+								.join("");
+							const candidateReasoning = candidateParts
+								.filter((part: any) => part.thought)
+								.map((part: any) => part.text)
+								.join("");
+							const candidateIndex = candidate.index ?? position;
+							const candidateToolCalls = candidateParts
+								.filter((part: any) => part.functionCall)
+								.map((part: any, fcIndex: number) => {
+									// parseProviderResponse only processes candidate 0, and it
+									// caches the thought signature under the id it emits
+									// (`${name}_${shortid(24)}`, as `thought_signature:<id>` in
+									// Redis). Reuse those exact tool calls so the id the client
+									// echoes back on the next turn is the one the signature is
+									// cached under. Regenerating a name+index id here (the scheme
+									// parse abandoned in #1448) made the Redis lookup miss and
+									// Gemini reject the replay with "Corrupted thought signature".
+									// Candidates parse did not process (1+) get the same
+									// treatment inline: unique id, inline signature, and the
+									// Redis entry under the emitted id.
+									if (
+										position === 0 &&
+										Array.isArray(toolResults) &&
+										toolResults[fcIndex]
+									) {
+										return toolResults[fcIndex];
+									}
+									const toolCall: any = {
+										id: `${part.functionCall.name}_${shortid(24)}`,
+										type: "function",
+										function: {
+											name: part.functionCall.name,
+											arguments: JSON.stringify(part.functionCall.args ?? {}),
+										},
+									};
+									if (part.thoughtSignature) {
+										toolCall.extra_content = {
+											google: {
+												thought_signature: part.thoughtSignature,
+											},
+										};
+										// Same cache as parse-provider-response: the id is the
+										// `thought_signature:<id>` key read back on the next turn.
+										redisClient
+											.setex(
+												`thought_signature:${toolCall.id}`,
+												86400,
+												part.thoughtSignature,
+											)
+											.catch((err) => {
+												logger.error("Failed to cache thought_signature", {
+													err,
+												});
+											});
+									}
+									return toolCall;
+								});
+							return {
+								index: candidateIndex,
+								message: {
+									role: "assistant",
+									content:
+										candidateContent.length > 0 ? candidateContent : null,
+									...(candidateReasoning.length > 0 && {
+										reasoning: candidateReasoning,
+									}),
+									...(candidateToolCalls.length > 0 && {
+										tool_calls: candidateToolCalls,
+									}),
+									...(position === 0 &&
+										images &&
+										images.length > 0 && { images }),
+									...(position === 0 &&
+										annotations &&
+										annotations.length > 0 && { annotations }),
+								},
+								finish_reason: mapFinishReasonToOpenai(
+									candidate.finishReason ?? finishReason,
+									usedProvider,
+									candidateToolCalls.length > 0,
+								),
+							};
+						})
+					: [
+							{
+								index: 0,
+								message: {
+									role: "assistant",
+									content: content,
+									...(reasoningContent !== null && {
+										reasoning: reasoningContent,
+									}),
+									...(toolResults && { tool_calls: toolResults }),
+									...(images && images.length > 0 && { images }),
+									...(annotations && annotations.length > 0 && { annotations }),
+								},
+								finish_reason: mapFinishReasonToOpenai(
+									finishReason,
+									usedProvider,
+									!!toolResults,
+								),
+							},
+						];
 			transformedResponse = {
 				id: `chatcmpl-${Date.now()}`,
 				object: "chat.completion",
@@ -376,26 +559,7 @@ export function transformResponseToOpenai(
 					undefined,
 					usedRegion,
 				),
-				choices: [
-					{
-						index: 0,
-						message: {
-							role: "assistant",
-							content: content,
-							...(reasoningContent !== null && {
-								reasoning: reasoningContent,
-							}),
-							...(toolResults && { tool_calls: toolResults }),
-							...(images && images.length > 0 && { images }),
-							...(annotations && annotations.length > 0 && { annotations }),
-						},
-						finish_reason: mapFinishReasonToOpenai(
-							finishReason,
-							usedProvider,
-							!!toolResults,
-						),
-					},
-				],
+				choices: googleChoices,
 				usage: buildUsageObject(
 					promptTokens,
 					completionTokens,
@@ -425,7 +589,6 @@ export function transformResponseToOpenai(
 			break;
 		}
 		case "anthropic":
-		case "anthropic-discount":
 		case "vertex-anthropic": {
 			transformedResponse = {
 				id: `chatcmpl-${Date.now()}`,
@@ -486,6 +649,8 @@ export function transformResponseToOpenai(
 		}
 		case "inference.net":
 		case "together-ai":
+		case "scx-ai":
+		case "scx-ai-gp":
 		case "groq": {
 			if (!transformedResponse.id) {
 				transformedResponse = {
@@ -611,7 +776,16 @@ export function transformResponseToOpenai(
 							...(toolResults && { tool_calls: toolResults }),
 							...(annotations && annotations.length > 0 && { annotations }),
 						},
-						finish_reason: finishReason ?? "stop",
+						// parseProviderResponse already maps Bedrock stop reasons to
+						// OpenAI-canonical values; mapFinishReasonToOpenai is idempotent
+						// for those and additionally surfaces a "refusal" as
+						// "content_filter" for OpenAI-compatible clients.
+						finish_reason:
+							mapFinishReasonToOpenai(
+								finishReason,
+								usedProvider,
+								!!toolResults,
+							) ?? "stop",
 					},
 				],
 				usage: buildUsageObject(
@@ -745,6 +919,9 @@ export function transformResponseToOpenai(
 		case "azure":
 		case "mistral":
 		case "novita":
+		case "sakana":
+		case "meta":
+		case "aws-mantle":
 		case "openai": {
 			// Handle OpenAI / Azure image generation responses (e.g. gpt-image-2)
 			// Format: { created: number, data: [{ b64_json?: string, url?: string }], usage?: {...} }
@@ -861,11 +1038,16 @@ export function transformResponseToOpenai(
 					// Update content and finish_reason with parsed values
 					if (transformedResponse.choices?.[0]?.message) {
 						const message = transformedResponse.choices[0].message;
-						// Update content with parsed content (handles JSON unwrapping for Mistral/Novita)
-						if (content !== null) {
+						// The parsed content/reasoning aggregate every choice for the
+						// log row when n > 1, so only write them back into choice 0
+						// for single-choice responses — otherwise choice 0 would
+						// carry the concatenation of all choices. (Single-choice
+						// updates handle JSON unwrapping for Mistral/Novita.)
+						const isSingleChoice = transformedResponse.choices.length === 1;
+						if (content !== null && isSingleChoice) {
 							message.content = content;
 						}
-						if (reasoningContent !== null) {
+						if (reasoningContent !== null && isSingleChoice) {
 							message.reasoning = reasoningContent;
 							// Remove the old reasoning_content field if it exists
 							delete message.reasoning_content;
@@ -1213,6 +1395,63 @@ export function transformResponseToOpenai(
 			break;
 		}
 		default: {
+			// For providers that return non-OpenAI format (e.g. Reve image generation),
+			// construct a proper OpenAI-compatible response when we have parsed images/content
+			if (
+				transformedResponse &&
+				typeof transformedResponse === "object" &&
+				!transformedResponse.choices &&
+				(images.length > 0 || content !== null)
+			) {
+				transformedResponse = {
+					id: `chatcmpl-${Date.now()}`,
+					object: "chat.completion",
+					created: Math.floor(Date.now() / 1000),
+					model: formatUsedModelForDisplay(
+						usedProvider,
+						baseModelName,
+						undefined,
+						usedRegion,
+					),
+					choices: [
+						{
+							index: 0,
+							message: {
+								role: "assistant",
+								content: content,
+								...(images && images.length > 0 && { images }),
+							},
+							finish_reason: "stop",
+						},
+					],
+					usage: buildUsageObject(
+						promptTokens,
+						completionTokens,
+						totalTokens,
+						reasoningTokens,
+						cachedTokens,
+						costs,
+						showUpgradeMessage,
+						cacheCreationTokens,
+						imageInputTokens,
+						imageOutputTokens,
+						cacheCreation5mTokens,
+						cacheCreation1hTokens,
+						audioInputTokens,
+					),
+					metadata: buildMetadata(
+						requestedModel,
+						requestedProvider,
+						baseModelName,
+						usedProvider,
+						usedModel,
+						requestId,
+						routing,
+						usedRegion,
+					),
+				};
+				break;
+			}
 			// For any other provider, add metadata to existing response
 			if (transformedResponse && typeof transformedResponse === "object") {
 				// Ensure content and reasoning fields are present with parsed/healed values
@@ -1231,6 +1470,13 @@ export function transformResponseToOpenai(
 					if (annotations && annotations.length > 0) {
 						message.annotations = annotations;
 					}
+				}
+				// Update finish_reason with the mapped value so canonicalizations
+				// applied by parseProviderResponse (e.g. "abort" -> "upstream_error",
+				// "tool_use" -> "tool_calls") reach the client instead of the raw
+				// upstream value, matching the provider-specific cases above.
+				if (transformedResponse.choices?.[0] && finishReason !== null) {
+					transformedResponse.choices[0].finish_reason = finishReason;
 				}
 				transformedResponse.model = formatUsedModelForDisplay(
 					usedProvider,
@@ -1265,6 +1511,14 @@ export function transformResponseToOpenai(
 			}
 			break;
 		}
+	}
+
+	if (
+		serviceTier !== undefined &&
+		transformedResponse &&
+		typeof transformedResponse === "object"
+	) {
+		transformedResponse.service_tier = serviceTier;
 	}
 
 	return transformedResponse;

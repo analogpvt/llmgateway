@@ -1,20 +1,23 @@
 import "dotenv/config";
-import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "vitest";
 
 import { app } from "@/index.js";
 import { deleteAll } from "@/testing.js";
 
+import { readProviderKey } from "@llmgateway/actions";
 import { db, tables } from "@llmgateway/db";
 import {
 	getProviderEnvVar,
 	getTestOptions,
+	isStealthProvider,
 	models,
 	providers,
 } from "@llmgateway/models";
+import { uniqueId } from "@llmgateway/shared/random";
 
 // Helper function to generate unique IDs for tests
 function generateTestId(): string {
-	return `test-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+	return uniqueId("test");
 }
 
 // Helper function to check if a provider has any active models
@@ -116,8 +119,22 @@ describe(
 			return { token, orgId };
 		}
 
+		// Stealth providers have no default base URL and are rejected by
+		// POST /keys/provider, so exclude them from the happy-path table (their
+		// rejection is asserted separately below). Otherwise a CI-provided stealth
+		// key (e.g. LLM_GRANITE_API_KEY) would make the 200 expectation fail.
 		const testProviders = providers
-			.filter((provider) => provider.id !== "llmgateway")
+			.filter(
+				(provider) =>
+					provider.id !== "llmgateway" && !isStealthProvider(provider),
+			)
+			.map((provider) => ({
+				providerId: provider.id,
+				name: provider.name,
+			}));
+
+		const stealthProviders = providers
+			.filter((provider) => isStealthProvider(provider))
 			.map((provider) => ({
 				providerId: provider.id,
 				name: provider.name,
@@ -187,9 +204,185 @@ describe(
 				});
 				expect(providerKey).not.toBeNull();
 				expect(providerKey?.provider).toBe(providerId);
-				expect(providerKey?.token).toBe(envVarValue);
+				// Stored encrypted at rest: the legacy plaintext column stays NULL
+				// and the ciphertext decrypts back to the submitted key.
+				// eslint-disable-next-line no-restricted-syntax
+				expect(providerKey?.token).toBeNull();
+				expect(providerKey?.tokenCiphertext).toMatch(/^llmgw:v2:/);
+				expect(readProviderKey(providerKey!)).toBe(envVarValue);
 			},
 		);
+
+		test.each(stealthProviders)(
+			"POST /keys/provider rejects stealth $name key",
+			async ({ providerId }) => {
+				const { token, orgId } = await setupTestData();
+
+				const res = await app.request("/keys/provider", {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						Cookie: token,
+					},
+					body: JSON.stringify({
+						provider: providerId,
+						token: "stealth-test-token",
+						organizationId: orgId,
+					}),
+				});
+
+				expect(res.status).toBe(400);
+
+				const providerKey = await db.query.providerKey.findFirst({
+					where: {
+						provider: {
+							eq: providerId,
+						},
+						organizationId: {
+							eq: orgId,
+						},
+					},
+				});
+				expect(providerKey).toBeUndefined();
+			},
+		);
+
+		// A Model Studio credential comes in two shapes: a legacy account key and
+		// a newer workspace-scoped `sk-ws-…` key. Both must register through the
+		// same dialog, and the workspace id is only ever an optional upgrade.
+		describe("alibaba credential shapes", () => {
+			const legacyKey = process.env.LLM_ALIBABA_API_KEY;
+			const frankfurtKey = process.env.LLM_ALIBABA_API_KEY__EU_FRANKFURT;
+			const frankfurtWorkspaceId =
+				process.env.LLM_ALIBABA_WORKSPACE_ID__EU_FRANKFURT;
+
+			async function createAlibabaKey(
+				providerToken: string,
+				options?: Record<string, string>,
+			) {
+				const { token, orgId } = await setupTestData();
+				const res = await app.request("/keys/provider", {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						Cookie: token,
+					},
+					body: JSON.stringify({
+						provider: "alibaba",
+						token: providerToken,
+						organizationId: orgId,
+						...(options ? { options } : {}),
+					}),
+				});
+				return { res, orgId };
+			}
+
+			test("registers a key for a region with a shared DashScope host", async () => {
+				if (!legacyKey) {
+					console.log("Skipping - no LLM_ALIBABA_API_KEY provided");
+					return;
+				}
+				const { res } = await createAlibabaKey(legacyKey, {
+					alibaba_region: "singapore",
+				});
+				expect(await res.json()).toHaveProperty("providerKey");
+				expect(res.status).toBe(200);
+			});
+
+			test("registers a workspace-scoped key with its workspace id", async () => {
+				if (!frankfurtKey || !frankfurtWorkspaceId) {
+					console.log("Skipping - no Frankfurt key/workspace id provided");
+					return;
+				}
+				const { res, orgId } = await createAlibabaKey(frankfurtKey, {
+					alibaba_region: "eu-frankfurt",
+					alibaba_workspace_id: frankfurtWorkspaceId,
+				});
+				expect(res.status).toBe(200);
+
+				const providerKey = await db.query.providerKey.findFirst({
+					where: {
+						provider: { eq: "alibaba" },
+						organizationId: { eq: orgId },
+					},
+				});
+				expect(providerKey?.options?.alibaba_workspace_id).toBe(
+					frankfurtWorkspaceId,
+				);
+			});
+
+			test("registers a workspace-scoped key without a workspace id", async () => {
+				if (!frankfurtKey) {
+					console.log("Skipping - no Frankfurt key provided");
+					return;
+				}
+				const { res } = await createAlibabaKey(frankfurtKey, {
+					alibaba_region: "eu-frankfurt",
+				});
+				expect(res.status).toBe(200);
+			});
+
+			test("rejects a workspace id that is not a bare hostname label", async () => {
+				if (!frankfurtKey) {
+					console.log("Skipping - no Frankfurt key provided");
+					return;
+				}
+				const { res } = await createAlibabaKey(frankfurtKey, {
+					alibaba_region: "eu-frankfurt",
+					alibaba_workspace_id: "evil.example.com/x",
+				});
+				expect(res.status).toBe(400);
+			});
+		});
+
+		describe("SSRF protection at registration", () => {
+			const originalFlag = process.env.ALLOW_INSECURE_PROVIDER_URLS;
+
+			afterEach(() => {
+				if (originalFlag === undefined) {
+					delete process.env.ALLOW_INSECURE_PROVIDER_URLS;
+				} else {
+					process.env.ALLOW_INSECURE_PROVIDER_URLS = originalFlag;
+				}
+			});
+
+			async function createCustomProvider(baseUrl: string) {
+				const { token, orgId } = await setupTestData();
+				return await app.request("/keys/provider", {
+					method: "POST",
+					headers: {
+						"Content-Type": "application/json",
+						Cookie: token,
+					},
+					body: JSON.stringify({
+						provider: "custom",
+						name: "evilprovider",
+						token: "dummy-token",
+						baseUrl,
+						organizationId: orgId,
+					}),
+				});
+			}
+
+			test.each([
+				"http://127.0.0.1:9999", // not https
+				"https://127.0.0.1:9999", // loopback literal
+				"https://169.254.169.254", // cloud metadata
+				"https://10.0.0.5", // RFC-1918
+				"https://[::1]:443", // IPv6 loopback
+				"http://api.example.com", // public but not https
+			])("rejects internal/non-https baseUrl %s", async (baseUrl) => {
+				process.env.ALLOW_INSECURE_PROVIDER_URLS = "false";
+				const res = await createCustomProvider(baseUrl);
+				expect(res.status).toBe(400);
+			});
+
+			test("allows an internal baseUrl when explicitly opted out", async () => {
+				process.env.ALLOW_INSECURE_PROVIDER_URLS = "true";
+				const res = await createCustomProvider("http://127.0.0.1:9999");
+				expect(res.status).toBe(200);
+			});
+		});
 
 		// test.skip("POST /keys/provider with custom baseUrl", async () => {
 		// 	if (!process.env.OPENAI_API_KEY) {

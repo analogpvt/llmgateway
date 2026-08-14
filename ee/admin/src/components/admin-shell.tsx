@@ -2,24 +2,29 @@
 
 import { useQueryClient } from "@tanstack/react-query";
 import {
+	Activity,
 	AlertTriangle,
 	BarChart3,
 	Building2,
 	Cpu,
 	Gauge,
 	GitMerge,
+	KeyRound,
 	LayoutDashboard,
 	LogOut,
 	Mail,
 	Menu,
 	MessageCircle,
+	MessageSquare,
 	Percent,
+	Route,
 	Server,
 	Sparkles,
 } from "lucide-react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 
+import { ThemeToggle } from "@/components/landing/theme-toggle";
 import { Button } from "@/components/ui/button";
 import {
 	Sidebar,
@@ -36,6 +41,7 @@ import {
 	SidebarTrigger,
 	useSidebar,
 } from "@/components/ui/sidebar";
+import { useUser } from "@/hooks/useUser";
 import { useAuth } from "@/lib/auth-client";
 
 import { Logo } from "./ui/logo";
@@ -44,6 +50,12 @@ import type { ReactNode } from "react";
 
 interface AdminShellProps {
 	children: ReactNode;
+	/**
+	 * Server-rendered session-cookie presence. Used only as the fallback while
+	 * `/user/me` is still in flight, so the navigation does not flash in or out
+	 * on every full page load.
+	 */
+	signedIn: boolean;
 }
 
 function MobileHeader() {
@@ -73,26 +85,51 @@ function MobileHeader() {
 					</span>
 				</div>
 			</div>
+			<ThemeToggle size="compact" className="ml-auto" />
 		</header>
 	);
 }
 
-export function AdminShell({ children }: AdminShellProps) {
+export function AdminShell({ children, signedIn }: AdminShellProps) {
 	const pathname = usePathname();
 	const router = useRouter();
 	const { signOut } = useAuth();
 	const queryClient = useQueryClient();
+	const { user, isLoading, error } = useUser();
+
+	// Visitors without an admin session never see the navigation: the section
+	// list would suggest there is something reachable behind it, and a sign out
+	// button makes no sense when nobody is signed in.
+	const showNav = user ? user.isAdmin : isLoading && !error && signedIn;
+
+	if (!showNav) {
+		return (
+			<div className="relative min-h-svh w-full">
+				<div className="absolute right-4 top-4 z-50">
+					<ThemeToggle size="compact" />
+				</div>
+				{children}
+			</div>
+		);
+	}
 
 	const isDashboard = pathname === "/" || pathname === "";
 	const isOrganizations = pathname.startsWith("/organizations");
 	const isDevpass = pathname.startsWith("/devpass");
+	const isChatPlans = pathname.startsWith("/chat-plans");
 	const isGlobalStats = pathname.startsWith("/global-stats");
 	const isDiscounts = pathname === "/discounts";
 	const isRateLimits = pathname === "/rate-limits";
 	const isProviders = pathname === "/providers";
+	const isProviderCredentials = pathname.startsWith("/provider-credentials");
 	const isModels = pathname === "/models";
 	const isModelProviderMappings = pathname === "/model-provider-mappings";
+	const isRoutingAnalytics = pathname.startsWith("/routing-analytics");
+	const isUnstableMappings = pathname.startsWith("/unstable-mappings");
 	const isContactSubmissions = pathname.startsWith("/contact-submissions");
+	const isProviderListingRequests = pathname.startsWith(
+		"/provider-listing-requests",
+	);
 	const isChatSupportLogs = pathname.startsWith("/chat-support-logs");
 	const isPaymentFailures = pathname.startsWith("/payment-failures");
 
@@ -157,6 +194,14 @@ export function AdminShell({ children }: AdminShellProps) {
 								</Link>
 							</SidebarMenuItem>
 							<SidebarMenuItem>
+								<Link href="/chat-plans" className="block">
+									<SidebarMenuButton isActive={isChatPlans} size="lg">
+										<MessageSquare className="h-4 w-4" />
+										<span>Lounge Plans</span>
+									</SidebarMenuButton>
+								</Link>
+							</SidebarMenuItem>
+							<SidebarMenuItem>
 								<Link href="/global-stats" className="block">
 									<SidebarMenuButton isActive={isGlobalStats} size="lg">
 										<BarChart3 className="h-4 w-4" />
@@ -168,7 +213,7 @@ export function AdminShell({ children }: AdminShellProps) {
 								<Link href="/discounts" className="block">
 									<SidebarMenuButton isActive={isDiscounts} size="lg">
 										<Percent className="h-4 w-4" />
-										<span>Global Discounts</span>
+										<span>Discounts</span>
 									</SidebarMenuButton>
 								</Link>
 							</SidebarMenuItem>
@@ -185,6 +230,14 @@ export function AdminShell({ children }: AdminShellProps) {
 									<SidebarMenuButton isActive={isProviders} size="lg">
 										<Server className="h-4 w-4" />
 										<span>Providers</span>
+									</SidebarMenuButton>
+								</Link>
+							</SidebarMenuItem>
+							<SidebarMenuItem>
+								<Link href="/provider-credentials" className="block">
+									<SidebarMenuButton isActive={isProviderCredentials} size="lg">
+										<KeyRound className="h-4 w-4" />
+										<span>Provider Credentials</span>
 									</SidebarMenuButton>
 								</Link>
 							</SidebarMenuItem>
@@ -208,10 +261,37 @@ export function AdminShell({ children }: AdminShellProps) {
 								</Link>
 							</SidebarMenuItem>
 							<SidebarMenuItem>
+								<Link href="/routing-analytics" className="block">
+									<SidebarMenuButton isActive={isRoutingAnalytics} size="lg">
+										<Route className="h-4 w-4" />
+										<span>Routing Analytics</span>
+									</SidebarMenuButton>
+								</Link>
+							</SidebarMenuItem>
+							<SidebarMenuItem>
+								<Link href="/unstable-mappings" className="block">
+									<SidebarMenuButton isActive={isUnstableMappings} size="lg">
+										<Activity className="h-4 w-4" />
+										<span>Unstable Mappings</span>
+									</SidebarMenuButton>
+								</Link>
+							</SidebarMenuItem>
+							<SidebarMenuItem>
 								<Link href="/contact-submissions" className="block">
 									<SidebarMenuButton isActive={isContactSubmissions} size="lg">
 										<Mail className="h-4 w-4" />
 										<span>Contact Submissions</span>
+									</SidebarMenuButton>
+								</Link>
+							</SidebarMenuItem>
+							<SidebarMenuItem>
+								<Link href="/provider-listing-requests" className="block">
+									<SidebarMenuButton
+										isActive={isProviderListingRequests}
+										size="lg"
+									>
+										<Building2 className="h-4 w-4" />
+										<span>Provider Requests</span>
 									</SidebarMenuButton>
 								</Link>
 							</SidebarMenuItem>
@@ -235,6 +315,9 @@ export function AdminShell({ children }: AdminShellProps) {
 					</SidebarGroup>
 				</SidebarContent>
 				<SidebarFooter className="border-t border-sidebar-border/60">
+					<div className="flex justify-center">
+						<ThemeToggle size="compact" />
+					</div>
 					<Button
 						variant="ghost"
 						size="sm"

@@ -4,6 +4,9 @@ import {
 	ClineIcon,
 	CodexIcon,
 	CursorIcon,
+	DevPassCodeIcon,
+	EmpryoIcon,
+	GitHubCopilotIcon,
 	N8nIcon,
 	OpenClawIcon,
 	OpenCodeIcon,
@@ -27,6 +30,13 @@ export interface AgentDefinition {
 }
 
 export const AGENTS: AgentDefinition[] = [
+	{
+		id: "devpass-code",
+		label: "DevPass Code",
+		icon: DevPassCodeIcon,
+		sources: ["devpass-code"],
+		guideUrl: "/guides/devpass-code",
+	},
 	{
 		id: "claude-code",
 		label: "Claude Code",
@@ -56,6 +66,13 @@ export const AGENTS: AgentDefinition[] = [
 		guideUrl: "/guides/autohand",
 	},
 	{
+		id: "empryo",
+		label: "Empryo",
+		icon: EmpryoIcon,
+		sources: ["empryo"],
+		guideUrl: "/guides/empryo",
+	},
+	{
 		id: "soulforge",
 		label: "SoulForge",
 		icon: SoulForgeIcon,
@@ -75,6 +92,13 @@ export const AGENTS: AgentDefinition[] = [
 		icon: CodexIcon,
 		sources: ["codex"],
 		guideUrl: "/guides/codex",
+	},
+	{
+		id: "github-copilot",
+		label: "GitHub Copilot",
+		icon: GitHubCopilotIcon,
+		sources: ["github-copilot", "copilot"],
+		guideUrl: "/guides/github-copilot",
 	},
 	{
 		id: "n8n",
@@ -118,6 +142,12 @@ export interface AgentStats {
 }
 
 export function formatTokens(count: number): string {
+	if (count >= 1_000_000_000_000) {
+		return `${(count / 1_000_000_000_000).toFixed(1)}T`;
+	}
+	if (count >= 1_000_000_000) {
+		return `${(count / 1_000_000_000).toFixed(1)}B`;
+	}
 	if (count >= 1_000_000) {
 		return `${(count / 1_000_000).toFixed(1)}M`;
 	}

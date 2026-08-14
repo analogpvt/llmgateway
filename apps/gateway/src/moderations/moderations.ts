@@ -5,6 +5,8 @@ import { createLogEntry } from "@/chat/tools/create-log-entry.js";
 import { extractCustomHeaders } from "@/chat/tools/extract-custom-headers.js";
 import { getFinishReasonFromError } from "@/chat/tools/get-finish-reason-from-error.js";
 import { getProviderEnv } from "@/chat/tools/get-provider-env.js";
+import { resolvePlatformCredential } from "@/chat/tools/resolve-platform-credential.js";
+import { shouldRetryAlternateKey } from "@/chat/tools/retry-with-fallback.js";
 import { validateSource } from "@/chat/tools/validate-source.js";
 import {
 	reportKeyError,
@@ -12,22 +14,42 @@ import {
 	reportTrackedKeyError,
 	reportTrackedKeySuccess,
 } from "@/lib/api-key-health.js";
-import { assertApiKeyWithinUsageLimits } from "@/lib/api-key-usage-limits.js";
+import {
+	assertApiKeyWithinUsageLimits,
+	assertMemberWithinBudget,
+} from "@/lib/api-key-usage-limits.js";
 import {
 	findApiKeyByToken,
 	findOrganizationById,
 	findProjectById,
 	findProviderKey,
 } from "@/lib/cached-queries.js";
+import { getClientIpFromRequest } from "@/lib/client-ip.js";
+import { assertProviderCompliant } from "@/lib/compliance.js";
+import {
+	applyEndUserSession,
+	assertTestWalletModelAllowed,
+} from "@/lib/end-user-session.js";
+import { buildOpenAIErrorBody } from "@/lib/error-response.js";
 import { extractApiToken } from "@/lib/extract-api-token.js";
+import { throwIamException, validateRequestModelAccess } from "@/lib/iam.js";
 import { calculateDataStorageCost, insertLog } from "@/lib/logs.js";
 import { createCombinedSignal, isTimeoutError } from "@/lib/timeout-config.js";
 
-import { getProviderHeaders } from "@llmgateway/actions";
+import { getProviderHeaders, readProviderKey } from "@llmgateway/actions";
 import { shortid } from "@llmgateway/db";
+import { getOrganizationEnvVariant, models } from "@llmgateway/models";
 
 import type { ServerTypes } from "@/vars.js";
 import type { InferSelectModel, tables } from "@llmgateway/db";
+
+/**
+ * Flat per-request price for `/v1/moderations`, in USD. OpenAI serves the
+ * moderation models for free, but we still pay for the request handling,
+ * logging and storage around it, so every successful moderation is billed at
+ * this fixed rate regardless of input size or moderation model.
+ */
+export const MODERATION_REQUEST_PRICE = 0.00001;
 
 const moderationInputTextSchema = z.string().openapi({
 	description: "Plain text input to classify.",
@@ -170,6 +192,71 @@ function getResponseContent(responseJson: unknown): string | null {
 	return JSON.stringify(responseJson);
 }
 
+function getAvailableCredits(
+	organization: InferSelectModel<typeof tables.organization>,
+) {
+	const regularCredits = parseFloat(organization.credits ?? "0");
+	const devPlanCreditsRemaining =
+		organization.devPlan !== "none"
+			? parseFloat(organization.devPlanCreditsLimit ?? "0") -
+				parseFloat(organization.devPlanCreditsUsed ?? "0")
+			: 0;
+	const chatPlanCreditsRemaining =
+		organization.chatPlan !== "none"
+			? parseFloat(organization.chatPlanCreditsLimit ?? "0") -
+				parseFloat(organization.chatPlanCreditsUsed ?? "0")
+			: 0;
+
+	return {
+		devPlanCreditsRemaining,
+		chatPlanCreditsRemaining,
+		totalAvailableCredits:
+			regularCredits + devPlanCreditsRemaining + chatPlanCreditsRemaining,
+	};
+}
+
+/**
+ * Moderation is billed per request, so a request that would be served with our
+ * credentials needs a credit balance behind it. Mirrors the credit gate on the
+ * other paid endpoints; there is no free-model escape hatch here because the
+ * moderation pseudo-model is always billed.
+ */
+function assertCreditsAvailableForModeration(
+	organization: InferSelectModel<typeof tables.organization>,
+	insufficientCreditsMessage: string,
+	devPlanCreditLimitMessage: (renewalDate: string) => string,
+) {
+	const {
+		devPlanCreditsRemaining,
+		chatPlanCreditsRemaining,
+		totalAvailableCredits,
+	} = getAvailableCredits(organization);
+
+	if (totalAvailableCredits > 0) {
+		return;
+	}
+
+	if (organization.devPlan !== "none" && devPlanCreditsRemaining <= 0) {
+		const renewalDate = organization.devPlanExpiresAt
+			? new Date(organization.devPlanExpiresAt).toLocaleDateString()
+			: "your next billing date";
+		throw new HTTPException(402, {
+			message: devPlanCreditLimitMessage(renewalDate),
+		});
+	}
+
+	if (organization.chatPlan !== "none" && chatPlanCreditsRemaining <= 0) {
+		const renewalDate = organization.chatPlanExpiresAt
+			? new Date(organization.chatPlanExpiresAt).toLocaleDateString()
+			: "your next billing date";
+		throw new HTTPException(402, {
+			message: `Chat Plan credit limit reached. Upgrade your plan or wait for renewal on ${renewalDate}.`,
+		});
+	}
+
+	throw new HTTPException(402, { message: insufficientCreditsMessage });
+}
+
 export const moderations = new OpenAPIHono<ServerTypes>();
 
 const createModeration = createRoute({
@@ -216,6 +303,14 @@ const createModeration = createRoute({
 				},
 			},
 			description: "Unauthorized request.",
+		},
+		402: {
+			content: {
+				"application/json": {
+					schema: moderationErrorSchema,
+				},
+			},
+			description: "Payment required / insufficient credits.",
 		},
 		403: {
 			content: {
@@ -337,44 +432,127 @@ moderations.openapi(createModeration, async (c): Promise<any> => {
 	const token = extractApiToken(c);
 	const apiKey = await findApiKeyByToken(token);
 
-	if (!apiKey || apiKey.status !== "active") {
+	if (!apiKey) {
 		throw new HTTPException(401, {
 			message:
-				"Unauthorized: Invalid LLMGateway API token. Please make sure the token is not deleted or disabled. Go to the LLMGateway 'API Keys' page to generate a new token.",
+				"Unauthorized: Invalid LLMGateway API token. The token could not be found. Go to the LLMGateway 'API Keys' page to generate a new token.",
 		});
 	}
 
-	assertApiKeyWithinUsageLimits(apiKey);
+	if (apiKey.status !== "active") {
+		throw new HTTPException(401, {
+			message:
+				"Unauthorized: This LLMGateway API token is not active (it may be disabled or deleted). Go to the LLMGateway 'API Keys' page to generate a new token.",
+		});
+	}
 
-	const project = await findProjectById(apiKey.projectId);
-	if (!project) {
+	const baseProject = await findProjectById(apiKey.projectId);
+	if (!baseProject) {
 		throw new HTTPException(500, {
 			message: "Could not find project",
 		});
 	}
 
-	if (project.status === "deleted") {
+	if (baseProject.status === "deleted") {
 		throw new HTTPException(410, {
 			message: "Project has been archived and is no longer accessible",
 		});
 	}
 
-	const organization = await findOrganizationById(project.organizationId);
-	if (!organization) {
+	// User-level limits take priority: enforce the per-member budget (set on the
+	// Teams page; fails open on read errors) before the per-key usage limits, so a
+	// member who is over budget is denied even if the key itself is within limits.
+	await assertMemberWithinBudget(apiKey.createdBy, baseProject.organizationId);
+	assertApiKeyWithinUsageLimits(apiKey);
+
+	const baseOrganization = await findOrganizationById(
+		baseProject.organizationId,
+	);
+	if (!baseOrganization) {
 		throw new HTTPException(500, {
 			message: "Could not find organization",
 		});
 	}
 
-	if (organization.status === "deleted") {
+	if (baseOrganization.status === "deleted") {
 		throw new HTTPException(410, {
 			message: "Organization has been disabled and is no longer accessible",
 		});
 	}
 
+	// LLM SDK: ephemeral end-user sessions bill the bound wallet instead
+	// of the developer's org credits. No-op for normal keys.
+	const { project, organization, wallet } = await applyEndUserSession(
+		c,
+		apiKey,
+		baseProject,
+		baseOrganization,
+	);
+
+	// Sandbox wallets can only spend on free models, so reject paid moderation
+	// requests from test-mode end-user sessions.
+	const moderationModelId = upstreamModel.includes("/")
+		? upstreamModel.slice(upstreamModel.lastIndexOf("/") + 1)
+		: upstreamModel;
+	assertTestWalletModelAllowed(
+		wallet,
+		models.find((m) => m.id === moderationModelId),
+	);
+
+	// IAM rules (member-level ceiling + key rules) apply to moderation like any
+	// other endpoint, but only provider and IP rule types: the moderation model
+	// is a fixed pseudo-model outside the catalogue, so model/pricing allowlists
+	// can never name it and evaluating them would deny existing keys with no way
+	// to allowlist it. deny/allow_providers ["openai"] and IP CIDR rules still
+	// gate moderation. End-user sessions are exempt: their model allowlists
+	// target chat models and must not block the moderation endpoint.
+	if (!apiKey.endUserSession) {
+		const iamValidation = await validateRequestModelAccess({
+			apiKey,
+			organizationId: project.organizationId,
+			requestedModel: "openai-moderation",
+			activeModelInfo: {
+				id: "openai-moderation",
+				family: "openai",
+				free: false,
+				providers: [
+					{
+						providerId: "openai",
+						externalId: upstreamModel,
+						streaming: false,
+					},
+				],
+			},
+			clientIp: getClientIpFromRequest(c),
+			applicableRuleTypes: [
+				"allow_providers",
+				"deny_providers",
+				"allow_ip_cidrs",
+				"deny_ip_cidrs",
+			],
+		});
+		if (!iamValidation.allowed) {
+			throwIamException(iamValidation.reason ?? "Model access denied");
+		}
+	}
+
+	// Enterprise provider compliance policy: moderation runs on OpenAI, so block
+	// before sending if the org's policy doesn't permit it.
+	await assertProviderCompliant(organization, "openai", {
+		organizationId: project.organizationId,
+		modelId: moderationModelId,
+		apiKeyId: apiKey.id,
+		model: upstreamModel,
+	});
+
 	const retentionLevel = organization.retentionLevel ?? "none";
 
+	// Which env-var variant (`__ENTERPRISE` / `__PLANS` overrides) applies to
+	// this org's env-credential reads. Undefined = base vars only.
+	const envVariant = getOrganizationEnvVariant(organization);
+
 	let providerKey: InferSelectModel<typeof tables.providerKey> | undefined;
+	let managedKey: InferSelectModel<typeof tables.providerKey> | undefined;
 	let usedToken: string | undefined;
 	let configIndex = 0;
 	let envVarName: string | undefined;
@@ -391,14 +569,25 @@ moderations.openapi(createModeration, async (c): Promise<any> => {
 					"No API key set for provider: openai. Please add a provider key in your settings or add credits and switch to credits or hybrid mode.",
 			});
 		}
-		usedToken = providerKey.token;
+		usedToken = readProviderKey(providerKey);
 	} else if (project.mode === "credits") {
-		const envResult = getProviderEnv("openai", {
+		assertCreditsAvailableForModeration(
+			organization,
+			`Organization ${organization.id} has insufficient credits`,
+			(renewalDate) =>
+				`Dev Plan credit limit reached. Upgrade your plan or wait for renewal on ${renewalDate}.`,
+		);
+
+		const platformCredential = await resolvePlatformCredential("openai", {
 			selectionScope: upstreamModel,
+			variant: envVariant,
+			region: undefined,
+			requiresServiceTier: false,
 		});
-		usedToken = envResult.token;
-		configIndex = envResult.configIndex;
-		envVarName = envResult.envVarName;
+		managedKey = platformCredential.managedKey;
+		usedToken = platformCredential.token;
+		configIndex = platformCredential.configIndex;
+		envVarName = platformCredential.envVarName;
 	} else if (project.mode === "hybrid") {
 		providerKey = await findProviderKey(
 			project.organizationId,
@@ -406,14 +595,25 @@ moderations.openapi(createModeration, async (c): Promise<any> => {
 			upstreamModel,
 		);
 		if (providerKey) {
-			usedToken = providerKey.token;
+			usedToken = readProviderKey(providerKey);
 		} else {
-			const envResult = getProviderEnv("openai", {
+			assertCreditsAvailableForModeration(
+				organization,
+				"No API key set for provider and organization has insufficient credits",
+				(renewalDate) =>
+					`No API key set for provider. Dev Plan credit limit reached. Upgrade your plan or wait for renewal on ${renewalDate}.`,
+			);
+
+			const platformCredential = await resolvePlatformCredential("openai", {
 				selectionScope: upstreamModel,
+				variant: envVariant,
+				region: undefined,
+				requiresServiceTier: false,
 			});
-			usedToken = envResult.token;
-			configIndex = envResult.configIndex;
-			envVarName = envResult.envVarName;
+			managedKey = platformCredential.managedKey;
+			usedToken = platformCredential.token;
+			configIndex = platformCredential.configIndex;
+			envVarName = platformCredential.envVarName;
 		}
 	} else {
 		throw new HTTPException(400, {
@@ -427,7 +627,13 @@ moderations.openapi(createModeration, async (c): Promise<any> => {
 		});
 	}
 
-	const upstreamUrl = `${providerKey?.baseUrl ?? "https://api.openai.com"}/v1/moderations`;
+	// Moderation has never honored LLM_OPENAI_BASE_URL, so only the credential's
+	// own base URL overrides the default here.
+	const resolvedBaseUrl =
+		providerKey?.baseUrl ??
+		managedKey?.config?.baseUrl ??
+		"https://api.openai.com";
+	const upstreamUrl = `${resolvedBaseUrl}/v1/moderations`;
 	const requestBody = {
 		input,
 		model: upstreamModel,
@@ -437,7 +643,8 @@ moderations.openapi(createModeration, async (c): Promise<any> => {
 		requestId,
 		project,
 		apiKey,
-		providerKeyId: providerKey?.id,
+		organizationProviderKeyId: providerKey?.id,
+		usedProviderKeyId: providerKey?.id ?? managedKey?.id,
 		usedModel: "openai-moderation",
 		usedModelMapping: upstreamModel,
 		usedProvider: "openai",
@@ -445,6 +652,7 @@ moderations.openapi(createModeration, async (c): Promise<any> => {
 		requestedProvider: "openai",
 		messages: normalizedMessages,
 		source,
+		apiOrigin: "moderations",
 		customHeaders,
 		debugMode,
 		userAgent,
@@ -458,263 +666,363 @@ moderations.openapi(createModeration, async (c): Promise<any> => {
 	};
 	c.req.raw.signal.addEventListener("abort", onAbort);
 
-	let upstreamResponse: Response;
-	let upstreamText: string;
-	let duration: number;
-	let responseSize: number;
+	// An auth failure (or transient upstream failure) is often isolated to a
+	// single credential, so rotate through the remaining env keys instead of
+	// failing the request on the first bad key — mirroring the alternate-key
+	// retry in the chat completions route. Bounded by the number of configured
+	// keys: every tried index is excluded from re-selection.
+	const finalLogId = shortid();
+	const triedEnvIndices = new Set<number>();
+	const triedManagedKeyIds = new Set<string>();
+	const rotateToNextCredential = async (): Promise<boolean> => {
+		// A BYOK key is the organization's single credential for the provider;
+		// there is nothing else to rotate to.
+		if (providerKey) {
+			return false;
+		}
+
+		// A provider can have several active managed credentials, so re-resolve
+		// with the failed ones excluded before falling back to env rotation —
+		// mirroring the alternate-key retry in chat, embeddings, speech,
+		// transcriptions and OCR.
+		if (managedKey) {
+			triedManagedKeyIds.add(managedKey.id);
+			const next = await resolvePlatformCredential("openai", {
+				selectionScope: upstreamModel,
+				variant: envVariant,
+				region: undefined,
+				requiresServiceTier: false,
+				excludedProviderKeyIds: triedManagedKeyIds,
+			}).catch(() => undefined);
+
+			if (!next?.token) {
+				return false;
+			}
+			managedKey = next.managedKey;
+			usedToken = next.token;
+			configIndex = next.configIndex;
+			envVarName = next.envVarName;
+			return true;
+		}
+
+		if (envVarName === undefined) {
+			return false;
+		}
+		triedEnvIndices.add(configIndex);
+		try {
+			const envResult = getProviderEnv("openai", {
+				selectionScope: upstreamModel,
+				excludedIndices: triedEnvIndices,
+				variant: envVariant,
+			});
+			usedToken = envResult.token;
+			configIndex = envResult.configIndex;
+			envVarName = envResult.envVarName;
+			return true;
+		} catch {
+			return false;
+		}
+	};
 
 	try {
-		const fetchSignal = createCombinedSignal(controller);
-		upstreamResponse = await fetch(upstreamUrl, {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/json",
-				...getProviderHeaders("openai", usedToken, { requestId }),
-			},
-			body: JSON.stringify(requestBody),
-			signal: fetchSignal,
-		});
+		while (true) {
+			let upstreamResponse: Response;
+			let upstreamText: string;
+			let duration: number;
 
-		upstreamText = await upstreamResponse.text();
-		duration = Date.now() - startedAt;
-		responseSize = upstreamText.length;
-	} catch (error) {
-		duration = Date.now() - startedAt;
-		if (envVarName !== undefined) {
-			reportKeyError(envVarName, configIndex, 0);
-		}
-		if (providerKey?.id) {
-			reportTrackedKeyError(providerKey.id, 0);
-		}
-
-		const isCanceled = error instanceof Error && error.name === "AbortError";
-		const isTimeout = isTimeoutError(error);
-
-		await insertLog({
-			...baseLogEntry,
-			duration,
-			timeToFirstToken: null,
-			timeToFirstReasoningToken: null,
-			responseSize: 0,
-			content: null,
-			reasoningContent: null,
-			finishReason: isCanceled ? "canceled" : "upstream_error",
-			promptTokens: null,
-			completionTokens: null,
-			totalTokens: null,
-			reasoningTokens: null,
-			cachedTokens: null,
-			hasError: !isCanceled,
-			streamed: false,
-			canceled: isCanceled,
-			errorDetails: isCanceled
-				? null
-				: {
-						statusCode: 0,
-						statusText: error instanceof Error ? error.name : "FetchError",
-						responseText:
-							error instanceof Error ? error.message : String(error),
+			try {
+				const fetchSignal = createCombinedSignal(controller);
+				upstreamResponse = await fetch(upstreamUrl, {
+					method: "POST",
+					// SSRF: never follow redirects on an authenticated provider request. A
+					// tenant-supplied baseUrl could 3xx to an internal host at request time,
+					// and a redirect would also leak the upstream token.
+					redirect: "error",
+					headers: {
+						"Content-Type": "application/json",
+						...getProviderHeaders("openai", usedToken, { requestId }),
 					},
-			inputCost: 0,
-			outputCost: 0,
-			cachedInputCost: 0,
-			requestCost: 0,
-			webSearchCost: 0,
-			imageInputTokens: null,
-			imageOutputTokens: null,
-			imageInputCost: null,
-			imageOutputCost: null,
-			cost: 0,
-			estimatedCost: false,
-			discount: null,
-			pricingTier: null,
-			dataStorageCost: calculateDataStorageCost(
-				null,
-				null,
-				null,
-				null,
-				retentionLevel,
-			),
-			cached: false,
-			toolResults: null,
-		});
+					body: JSON.stringify(requestBody),
+					signal: fetchSignal,
+				});
 
-		if (isCanceled) {
-			return c.json(
+				upstreamText = await upstreamResponse.text();
+				duration = Date.now() - startedAt;
+			} catch (error) {
+				duration = Date.now() - startedAt;
+				if (envVarName !== undefined) {
+					reportKeyError(envVarName, configIndex, 0);
+				}
+				const failedKeyId = providerKey?.id ?? managedKey?.id;
+				if (failedKeyId) {
+					reportTrackedKeyError(failedKeyId, 0);
+				}
+
+				const isCanceled =
+					error instanceof Error && error.name === "AbortError";
+				const isTimeout = isTimeoutError(error);
+				const willRetry = !isCanceled && (await rotateToNextCredential());
+
+				await insertLog(
+					{
+						...baseLogEntry,
+						duration,
+						timeToFirstToken: null,
+						timeToFirstReasoningToken: null,
+						responseSize: 0,
+						content: null,
+						reasoningContent: null,
+						finishReason: isCanceled ? "canceled" : "upstream_error",
+						promptTokens: null,
+						completionTokens: null,
+						totalTokens: null,
+						reasoningTokens: null,
+						cachedTokens: null,
+						hasError: !isCanceled,
+						streamed: false,
+						canceled: isCanceled,
+						errorDetails: isCanceled
+							? null
+							: {
+									statusCode: 0,
+									statusText:
+										error instanceof Error ? error.name : "FetchError",
+									responseText:
+										error instanceof Error ? error.message : String(error),
+								},
+						inputCost: 0,
+						outputCost: 0,
+						cachedInputCost: 0,
+						requestCost: 0,
+						webSearchCost: 0,
+						imageInputTokens: null,
+						imageOutputTokens: null,
+						imageInputCost: null,
+						imageOutputCost: null,
+						cost: 0,
+						estimatedCost: false,
+						discount: null,
+						pricingTier: null,
+						dataStorageCost: calculateDataStorageCost(
+							null,
+							null,
+							null,
+							null,
+							retentionLevel,
+						),
+						cached: false,
+						toolResults: null,
+						retried: willRetry,
+						retriedByLogId: willRetry ? finalLogId : null,
+					},
+					{ retentionLevel },
+				);
+
+				if (willRetry) {
+					continue;
+				}
+
+				if (isCanceled) {
+					return c.json(
+						{
+							error: {
+								message: "Request canceled by client",
+								type: "canceled",
+								param: null,
+								code: "request_canceled",
+							},
+						},
+						400,
+					);
+				}
+
+				return c.json(
+					{
+						error: {
+							message: isTimeout
+								? `Upstream provider timeout: ${
+										error instanceof Error ? error.message : String(error)
+									}`
+								: `Failed to connect to provider: ${
+										error instanceof Error ? error.message : String(error)
+									}`,
+							type: isTimeout ? "upstream_timeout" : "upstream_error",
+							param: null,
+							code: isTimeout ? "timeout" : "fetch_failed",
+						},
+					},
+					isTimeout ? 504 : 502,
+				);
+			}
+
+			const responseSize = upstreamText.length;
+
+			let upstreamJson: unknown = null;
+			if (upstreamText) {
+				try {
+					upstreamJson = JSON.parse(upstreamText);
+				} catch {
+					upstreamJson = upstreamText;
+				}
+			}
+
+			if (!upstreamResponse.ok) {
+				if (envVarName !== undefined) {
+					reportKeyError(
+						envVarName,
+						configIndex,
+						upstreamResponse.status,
+						upstreamText,
+					);
+				}
+				const failedKeyId = providerKey?.id ?? managedKey?.id;
+				if (failedKeyId) {
+					reportTrackedKeyError(
+						failedKeyId,
+						upstreamResponse.status,
+						upstreamText,
+					);
+				}
+
+				const finishReason = getFinishReasonFromError(
+					upstreamResponse.status,
+					upstreamText,
+				);
+				const willRetry =
+					shouldRetryAlternateKey(
+						finishReason,
+						upstreamResponse.status,
+						upstreamText,
+					) && (await rotateToNextCredential());
+
+				await insertLog(
+					{
+						...baseLogEntry,
+						duration,
+						timeToFirstToken: null,
+						timeToFirstReasoningToken: null,
+						responseSize,
+						content: getResponseContent(upstreamJson),
+						reasoningContent: null,
+						finishReason,
+						promptTokens: null,
+						completionTokens: null,
+						totalTokens: null,
+						reasoningTokens: null,
+						cachedTokens: null,
+						hasError: true,
+						streamed: false,
+						canceled: false,
+						errorDetails: {
+							statusCode: upstreamResponse.status,
+							statusText: upstreamResponse.statusText,
+							responseText: upstreamText,
+						},
+						inputCost: 0,
+						outputCost: 0,
+						cachedInputCost: 0,
+						requestCost: 0,
+						webSearchCost: 0,
+						imageInputTokens: null,
+						imageOutputTokens: null,
+						imageInputCost: null,
+						imageOutputCost: null,
+						cost: 0,
+						estimatedCost: false,
+						discount: null,
+						pricingTier: null,
+						dataStorageCost: calculateDataStorageCost(
+							null,
+							null,
+							null,
+							null,
+							retentionLevel,
+						),
+						cached: false,
+						toolResults: null,
+						retried: willRetry,
+						retriedByLogId: willRetry ? finalLogId : null,
+					},
+					{ retentionLevel },
+				);
+
+				if (willRetry) {
+					continue;
+				}
+
+				return c.json(
+					(typeof upstreamJson === "string"
+						? buildOpenAIErrorBody({
+								message: upstreamJson,
+								status: upstreamResponse.status,
+							})
+						: upstreamJson) ??
+						buildOpenAIErrorBody({
+							message: "An error occurred",
+							status: upstreamResponse.status,
+						}),
+					upstreamResponse.status as
+						400 | 401 | 403 | 404 | 410 | 429 | 500 | 502 | 503 | 504,
+				);
+			}
+
+			if (envVarName !== undefined) {
+				reportKeySuccess(envVarName, configIndex);
+			}
+			const succeededKeyId = providerKey?.id ?? managedKey?.id;
+			if (succeededKeyId) {
+				reportTrackedKeySuccess(succeededKeyId);
+			}
+
+			await insertLog(
 				{
-					error: {
-						message: "Request canceled by client",
-						type: "canceled",
-						param: null,
-						code: "request_canceled",
-					},
+					...baseLogEntry,
+					id: finalLogId,
+					duration,
+					timeToFirstToken: null,
+					timeToFirstReasoningToken: null,
+					responseSize,
+					content: getResponseContent(upstreamJson),
+					reasoningContent: null,
+					finishReason: "stop",
+					promptTokens: null,
+					completionTokens: null,
+					totalTokens: null,
+					reasoningTokens: null,
+					cachedTokens: null,
+					hasError: false,
+					streamed: false,
+					canceled: false,
+					errorDetails: null,
+					inputCost: 0,
+					outputCost: 0,
+					cachedInputCost: 0,
+					requestCost: MODERATION_REQUEST_PRICE,
+					webSearchCost: 0,
+					imageInputTokens: null,
+					imageOutputTokens: null,
+					imageInputCost: null,
+					imageOutputCost: null,
+					cost: MODERATION_REQUEST_PRICE,
+					estimatedCost: false,
+					discount: null,
+					pricingTier: null,
+					dataStorageCost: calculateDataStorageCost(
+						null,
+						null,
+						null,
+						null,
+						retentionLevel,
+					),
+					cached: false,
+					toolResults: null,
 				},
-				400,
+				{ retentionLevel },
 			);
-		}
 
-		return c.json(
-			{
-				error: {
-					message: isTimeout
-						? `Upstream provider timeout: ${
-								error instanceof Error ? error.message : String(error)
-							}`
-						: `Failed to connect to provider: ${
-								error instanceof Error ? error.message : String(error)
-							}`,
-					type: isTimeout ? "upstream_timeout" : "upstream_error",
-					param: null,
-					code: isTimeout ? "timeout" : "fetch_failed",
-				},
-			},
-			isTimeout ? 504 : 502,
-		);
+			return c.json(upstreamJson as any);
+		}
 	} finally {
 		c.req.raw.signal.removeEventListener("abort", onAbort);
 	}
-
-	let upstreamJson: unknown = null;
-	if (upstreamText) {
-		try {
-			upstreamJson = JSON.parse(upstreamText);
-		} catch {
-			upstreamJson = upstreamText;
-		}
-	}
-
-	if (!upstreamResponse.ok) {
-		if (envVarName !== undefined) {
-			reportKeyError(
-				envVarName,
-				configIndex,
-				upstreamResponse.status,
-				upstreamText,
-			);
-		}
-		if (providerKey?.id) {
-			reportTrackedKeyError(
-				providerKey.id,
-				upstreamResponse.status,
-				upstreamText,
-			);
-		}
-
-		await insertLog({
-			...baseLogEntry,
-			duration,
-			timeToFirstToken: null,
-			timeToFirstReasoningToken: null,
-			responseSize,
-			content: getResponseContent(upstreamJson),
-			reasoningContent: null,
-			finishReason: getFinishReasonFromError(
-				upstreamResponse.status,
-				upstreamText,
-			),
-			promptTokens: null,
-			completionTokens: null,
-			totalTokens: null,
-			reasoningTokens: null,
-			cachedTokens: null,
-			hasError: true,
-			streamed: false,
-			canceled: false,
-			errorDetails: {
-				statusCode: upstreamResponse.status,
-				statusText: upstreamResponse.statusText,
-				responseText: upstreamText,
-			},
-			inputCost: 0,
-			outputCost: 0,
-			cachedInputCost: 0,
-			requestCost: 0,
-			webSearchCost: 0,
-			imageInputTokens: null,
-			imageOutputTokens: null,
-			imageInputCost: null,
-			imageOutputCost: null,
-			cost: 0,
-			estimatedCost: false,
-			discount: null,
-			pricingTier: null,
-			dataStorageCost: calculateDataStorageCost(
-				null,
-				null,
-				null,
-				null,
-				retentionLevel,
-			),
-			cached: false,
-			toolResults: null,
-		});
-
-		return c.json(
-			(typeof upstreamJson === "string"
-				? { error: { message: upstreamJson } }
-				: upstreamJson) ?? { error: true },
-			upstreamResponse.status as
-				| 400
-				| 401
-				| 403
-				| 404
-				| 410
-				| 429
-				| 500
-				| 502
-				| 503
-				| 504,
-		);
-	}
-
-	if (envVarName !== undefined) {
-		reportKeySuccess(envVarName, configIndex);
-	}
-	if (providerKey?.id) {
-		reportTrackedKeySuccess(providerKey.id);
-	}
-
-	await insertLog({
-		...baseLogEntry,
-		duration,
-		timeToFirstToken: null,
-		timeToFirstReasoningToken: null,
-		responseSize,
-		content: getResponseContent(upstreamJson),
-		reasoningContent: null,
-		finishReason: "stop",
-		promptTokens: null,
-		completionTokens: null,
-		totalTokens: null,
-		reasoningTokens: null,
-		cachedTokens: null,
-		hasError: false,
-		streamed: false,
-		canceled: false,
-		errorDetails: null,
-		inputCost: 0,
-		outputCost: 0,
-		cachedInputCost: 0,
-		requestCost: 0,
-		webSearchCost: 0,
-		imageInputTokens: null,
-		imageOutputTokens: null,
-		imageInputCost: null,
-		imageOutputCost: null,
-		cost: 0,
-		estimatedCost: false,
-		discount: null,
-		pricingTier: null,
-		dataStorageCost: calculateDataStorageCost(
-			null,
-			null,
-			null,
-			null,
-			retentionLevel,
-		),
-		cached: false,
-		toolResults: null,
-	});
-
-	return c.json(upstreamJson as any);
 });

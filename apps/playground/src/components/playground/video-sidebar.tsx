@@ -2,27 +2,23 @@
 
 import {
 	ChevronUp,
+	CreditCard,
 	Edit2,
 	ExternalLink,
 	Film,
-	ImageIcon,
 	LogOut,
-	MessageSquare,
 	MoreVerticalIcon,
-	PenTool,
-	Plus,
 	Trash2,
-	Users,
 } from "lucide-react";
 import Link from "next/link";
-import { usePathname, useRouter } from "next/navigation";
-import { useTheme } from "next-themes";
+import { useRouter, useSearchParams } from "next/navigation";
 import { usePostHog } from "posthog-js/react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { List, type RowComponentProps } from "react-window";
 
 import { CreditsDisplay } from "@/components/credits/credits-display";
 import { ThemeToggle } from "@/components/landing/theme-toggle";
+import { SidebarLoungePoints } from "@/components/lounge/sidebar-points";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -33,7 +29,6 @@ import {
 	DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
-import { Logo } from "@/components/ui/logo";
 import {
 	Sidebar,
 	SidebarContent,
@@ -45,6 +40,7 @@ import {
 	SidebarMenuItem,
 	useSidebar,
 } from "@/components/ui/sidebar";
+import { Wordmark } from "@/components/ui/wordmark";
 import { useOrganization } from "@/hooks/useOrganization";
 import {
 	useDeleteVideoHistory,
@@ -53,15 +49,24 @@ import {
 import { useUser } from "@/hooks/useUser";
 import { clearLastUsedProjectCookiesAction } from "@/lib/actions/project";
 import { useAuth } from "@/lib/auth-client";
+import { withOrgParam } from "@/lib/utils";
+
+import { HistorySkeleton } from "./history-skeleton";
+import { OrganizationSwitcher } from "./organization-switcher";
+import { SidebarChatSearch, SidebarNewAction } from "./sidebar-actions";
+import { StudioNav } from "./studio-nav";
 
 import type { Organization } from "@/lib/types";
 import type { VideoGalleryItem } from "@/lib/video-gen";
 
 interface VideoSidebarProps {
 	galleryItems: VideoGalleryItem[];
+	isHistoryLoading?: boolean;
 	onNewChat: () => void;
 	onItemClick: (itemId: string) => void;
+	organizations: Organization[];
 	selectedOrganization: Organization | null;
+	onSelectOrganization: (organization: Organization | null) => void;
 	currentItemId?: string | null;
 	className?: string;
 }
@@ -165,19 +170,7 @@ function EditVideoPromptInput({
 }
 
 function HistoryThumbnails({ item }: { item: VideoGalleryItem }) {
-	const images: { src: string; label: string }[] = [];
-
-	if (item.frameInputs?.start) {
-		images.push({ src: item.frameInputs.start.dataUrl, label: "First" });
-	}
-	if (item.frameInputs?.end) {
-		images.push({ src: item.frameInputs.end.dataUrl, label: "Last" });
-	}
-	if (item.referenceImages) {
-		for (const ref of item.referenceImages) {
-			images.push({ src: ref.dataUrl, label: "Ref" });
-		}
-	}
+	const images = item.inputPreviews ?? [];
 
 	if (images.length === 0) {
 		return null;
@@ -191,6 +184,7 @@ function HistoryThumbnails({ item }: { item: VideoGalleryItem }) {
 					src={img.src}
 					alt={img.label}
 					title={img.label}
+					loading="lazy"
 					className="h-5 w-5 rounded border object-cover"
 				/>
 			))}
@@ -357,15 +351,28 @@ function groupItemsByDate(items: VideoGalleryItem[]) {
 
 export function VideoSidebar({
 	galleryItems,
+	isHistoryLoading = false,
 	onNewChat,
 	onItemClick,
-	selectedOrganization: _selectedOrganization,
+	organizations,
+	selectedOrganization,
+	onSelectOrganization,
 	currentItemId,
 	className,
 }: VideoSidebarProps) {
+	const switcherOrganizations = organizations.filter(
+		(org) => org.kind === "default",
+	);
+	const switcherSelectedOrganization =
+		switcherOrganizations.find((org) => org.id === selectedOrganization?.id) ??
+		null;
 	const listContainerRef = useRef<HTMLDivElement | null>(null);
 	const router = useRouter();
-	const pathname = usePathname();
+	const searchParams = useSearchParams();
+	// Preserve the selected organization across playground navigation so users
+	// don't have to re-pick their org on every page.
+	const orgIdParam = searchParams.get("orgId");
+	const withOrg = (path: string) => withOrgParam(path, orgIdParam);
 	const posthog = usePostHog();
 	const { state: sidebarState, isMobile } = useSidebar();
 	const { user, isLoading: isUserLoading } = useUser();
@@ -385,18 +392,12 @@ export function VideoSidebar({
 					router.push(
 						process.env.NODE_ENV === "development"
 							? "http://localhost:3003/login"
-							: "https://chat.llmgateway.io/login",
+							: "https://lounge.llmgateway.io/login",
 					);
 				},
 			},
 		});
 	};
-
-	const { theme, setTheme, systemTheme } = useTheme();
-	const currentTheme = theme === "system" ? systemTheme : theme;
-	const toggleTheme = useCallback(() => {
-		setTheme(currentTheme === "dark" ? "light" : "dark");
-	}, [currentTheme, setTheme]);
 
 	const renameItem = useRenameVideoHistory();
 	const deleteItem = useDeleteVideoHistory();
@@ -530,11 +531,11 @@ export function VideoSidebar({
 							className="flex self-start items-center gap-2 my-2"
 							prefetch={true}
 						>
-							<Logo className="size-6" />
-							<h1 className="text-xl font-semibold">LLM Gateway</h1>
+							<Wordmark />
 							<Badge>Video</Badge>
 						</Link>
 					</div>
+					<StudioNav />
 				</SidebarHeader>
 			</Sidebar>
 		);
@@ -550,8 +551,7 @@ export function VideoSidebar({
 							className="flex self-start items-center gap-2 my-2"
 							prefetch={true}
 						>
-							<Logo className="size-6" />
-							<h1 className="text-xl font-semibold">LLM Gateway</h1>
+							<Wordmark />
 							<Badge>Video</Badge>
 						</Link>
 						<div className="w-full rounded-md border p-4 text-sm">
@@ -569,6 +569,7 @@ export function VideoSidebar({
 							</div>
 						</div>
 					</div>
+					<StudioNav />
 				</SidebarHeader>
 			</Sidebar>
 		);
@@ -582,100 +583,41 @@ export function VideoSidebar({
 			<SidebarHeader>
 				<SidebarMenu>
 					<SidebarMenuItem>
-						<SidebarMenuButton size="lg" asChild tooltip="LLM Gateway">
-							<Link href="/" prefetch={true}>
-								<div className="flex aspect-square size-8 items-center justify-center">
-									<Logo className="size-6" />
-								</div>
-								<span className="text-lg font-bold tracking-tight">
-									LLM Gateway
-								</span>
+						<SidebarMenuButton size="lg" asChild tooltip="Lounge">
+							<Link href={withOrg("/")} prefetch={true}>
+								<Wordmark size="sm" iconBox />
 							</Link>
 						</SidebarMenuButton>
 					</SidebarMenuItem>
-					<SidebarMenuItem>
-						<SidebarMenuButton
-							onClick={onNewChat}
-							tooltip="New Generation"
-							className="border border-border"
-						>
-							<Plus className="h-4 w-4" />
-							<span>New Generation</span>
-						</SidebarMenuButton>
-					</SidebarMenuItem>
-					<SidebarMenuItem>
-						<SidebarMenuButton
-							asChild
-							tooltip="Chat"
-							isActive={pathname === "/"}
-						>
-							<Link href="/">
-								<MessageSquare className="h-4 w-4" />
-								<span>Chat</span>
-							</Link>
-						</SidebarMenuButton>
-					</SidebarMenuItem>
-					<SidebarMenuItem>
-						<SidebarMenuButton
-							asChild
-							tooltip="Group Chat"
-							isActive={pathname === "/group"}
-						>
-							<Link href="/group">
-								<Users className="h-4 w-4" />
-								<span>Group Chat</span>
-							</Link>
-						</SidebarMenuButton>
-					</SidebarMenuItem>
-					<SidebarMenuItem>
-						<SidebarMenuButton
-							asChild
-							tooltip="Image Studio"
-							isActive={pathname === "/image"}
-						>
-							<Link href="/image">
-								<ImageIcon className="h-4 w-4" />
-								<span>Image Studio</span>
-							</Link>
-						</SidebarMenuButton>
-					</SidebarMenuItem>
-					<SidebarMenuItem>
-						<SidebarMenuButton
-							asChild
-							tooltip="Video Studio"
-							isActive={pathname === "/video"}
-						>
-							<Link href="/video">
-								<Film className="h-4 w-4" />
-								<span>Video Studio</span>
-							</Link>
-						</SidebarMenuButton>
-					</SidebarMenuItem>
-					<SidebarMenuItem>
-						<SidebarMenuButton
-							asChild
-							tooltip="Canvas"
-							isActive={pathname === "/canvas"}
-						>
-							<Link href="/canvas">
-								<PenTool className="h-4 w-4" />
-								<span>Canvas</span>
-							</Link>
-						</SidebarMenuButton>
-					</SidebarMenuItem>
+					<SidebarChatSearch disabled />
+					<SidebarNewAction label="New Generation" onAction={onNewChat} />
 				</SidebarMenu>
+				<StudioNav />
 			</SidebarHeader>
 
 			<SidebarContent className="overflow-hidden pb-2">
 				<div>
 					<div className="mx-2 mb-2 border-t border-sidebar-border" />
+					{switcherOrganizations.length > 0 ? (
+						<SidebarMenu className="px-2 pb-2 group-data-[collapsible=icon]:hidden">
+							<SidebarMenuItem>
+								<OrganizationSwitcher
+									organizations={switcherOrganizations}
+									selectedOrganization={switcherSelectedOrganization}
+									onSelectOrganization={onSelectOrganization}
+								/>
+							</SidebarMenuItem>
+						</SidebarMenu>
+					) : null}
 				</div>
 				<div
 					ref={listContainerRef}
 					aria-hidden={isHistoryHidden}
 					className="flex min-h-0 flex-1 flex-col transition-opacity duration-200 ease-linear group-data-[collapsible=icon]:pointer-events-none group-data-[collapsible=icon]:opacity-0"
 				>
-					{galleryItems.length === 0 ? (
+					{isHistoryLoading && galleryItems.length === 0 ? (
+						<HistorySkeleton withThumbnail />
+					) : galleryItems.length === 0 ? (
 						<div className="flex flex-col items-center justify-center py-8 text-center">
 							<Film className="h-12 w-12 text-muted-foreground/50 mb-4" />
 							<p className="text-sm text-muted-foreground mb-2">
@@ -700,10 +642,12 @@ export function VideoSidebar({
 			</SidebarContent>
 
 			<SidebarFooter>
+				<SidebarLoungePoints />
 				<div className="group-data-[collapsible=icon]:hidden">
 					<CreditsDisplay
-						organization={organization}
+						organization={switcherSelectedOrganization ?? organization}
 						isLoading={isOrgLoading}
+						isChatPlanOrg={!switcherSelectedOrganization}
 					/>
 				</div>
 				<SidebarMenu>
@@ -741,6 +685,13 @@ export function VideoSidebar({
 								sideOffset={4}
 							>
 								<DropdownMenuItem asChild>
+									<Link href="/pricing" prefetch={true}>
+										<CreditCard className="mr-2 h-4 w-4" />
+										Membership &amp; Billing
+									</Link>
+								</DropdownMenuItem>
+								<DropdownMenuSeparator />
+								<DropdownMenuItem asChild>
 									<a
 										href={
 											process.env.NODE_ENV === "development"
@@ -757,10 +708,7 @@ export function VideoSidebar({
 								<DropdownMenuSeparator />
 								<DropdownMenuItem
 									className="justify-between gap-3"
-									onSelect={(event) => {
-										event.preventDefault();
-										toggleTheme();
-									}}
+									onSelect={(event) => event.preventDefault()}
 								>
 									<span>Theme</span>
 									<div

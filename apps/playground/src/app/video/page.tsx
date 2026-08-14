@@ -15,9 +15,9 @@ import type { Project, Organization } from "@/lib/types";
 import type { Metadata } from "next";
 
 export const metadata: Metadata = {
-	title: "AI Video Generator — Compare Veo, Wan & More in One Playground",
+	title: "AI Video Generator — Compare Veo, Wan & More in One Place",
 	description:
-		"Generate videos with Veo, Wan, and other AI video models. Preview results and compare providers in one playground.",
+		"Generate videos with Veo, Wan, and other AI video models. Preview results and compare providers in Lounge.",
 	alternates: { canonical: "/video" },
 };
 
@@ -32,31 +32,31 @@ export default async function VideoPage({
 		cookieStore.get(VIDEO_MODEL_COOKIE)?.value,
 	);
 
-	const [models, providers] = await Promise.all([
-		fetchModels(),
-		fetchProviders(),
-	]);
-
-	const initialOrganizationsData = await fetchServerData("GET", "/orgs");
-
-	let initialProjectsData: { projects: Project[] } | null = null;
-	if (orgId) {
-		try {
-			initialProjectsData = (await fetchServerData(
-				"GET",
-				"/orgs/{id}/projects",
-				{
-					params: {
-						path: {
-							id: orgId,
+	const [models, providers, initialOrganizationsData, orgIdProjectsData] =
+		await Promise.all([
+			fetchModels(),
+			fetchProviders(),
+			// Ensure the dedicated Chat org exists, then list it so it can back the
+			// default billing context for the playground.
+			fetchServerData("GET", "/playground/chat-org").then(() =>
+				fetchServerData("GET", "/orgs", {
+					params: { query: { includeChat: "true" } },
+				}),
+			),
+			orgId
+				? fetchServerData("GET", "/orgs/{id}/projects", {
+						params: {
+							path: {
+								id: orgId,
+							},
 						},
-					},
-				},
-			)) as { projects: Project[] };
-		} catch (error) {
-			console.warn("Failed to fetch projects for organization:", orgId, error);
-		}
-	}
+					})
+				: null,
+		]);
+
+	let initialProjectsData = (orgIdProjectsData ?? null) as {
+		projects: Project[];
+	} | null;
 
 	if (
 		projectId &&
@@ -72,7 +72,7 @@ export default async function VideoPage({
 		}
 	}
 
-	const organizations = (
+	const allOrganizations = (
 		initialOrganizationsData &&
 		typeof initialOrganizationsData === "object" &&
 		"organizations" in initialOrganizationsData
@@ -80,8 +80,14 @@ export default async function VideoPage({
 					.organizations
 			: []
 	) as Organization[];
+	// The Chat org backs the default billing context and must not appear in the
+	// dashboard org switcher.
+	const chatOrg = allOrganizations.find((o) => o.kind === "chat") ?? null;
+	const organizations = allOrganizations.filter((o) => o.kind === "default");
 	const selectedOrganization =
-		(orgId ? organizations.find((o) => o.id === orgId) : organizations[0]) ??
+		(orgId ? organizations.find((o) => o.id === orgId) : null) ??
+		chatOrg ??
+		organizations[0] ??
 		null;
 
 	if (!initialProjectsData && selectedOrganization?.id) {

@@ -1,5 +1,7 @@
 import { HTTPException } from "hono/http-exception";
 
+import { validateModelOutput } from "@/lib/validate-model-output.js";
+
 import { logger } from "@llmgateway/logger";
 
 import type {
@@ -15,11 +17,13 @@ export interface ValidateModelCapabilitiesOptions {
 	};
 	reasoning_effort?: string;
 	reasoning_max_tokens?: number;
+	verbosity?: string;
 	tools?: unknown[];
 	tool_choice?: unknown;
 	webSearchTool?: WebSearchTool;
 	hasImages?: boolean;
 	hasDocuments?: boolean;
+	hasAssistantPrefill?: boolean;
 }
 
 /**
@@ -40,22 +44,27 @@ export function validateModelCapabilities(
 		response_format,
 		reasoning_effort,
 		reasoning_max_tokens,
+		verbosity,
 		tools,
 		tool_choice,
 		webSearchTool,
 		hasImages,
 		hasDocuments,
+		hasAssistantPrefill,
 	} = options;
 
-	if (
-		requestedModel !== "auto" &&
-		requestedModel !== "custom" &&
-		modelInfo.output?.includes("embedding")
-	) {
-		throw new HTTPException(400, {
-			message: `Model ${requestedModel} is an embeddings model and cannot be used with /v1/chat/completions. Use the /v1/embeddings endpoint instead.`,
-		});
+	// Custom providers have no catalog entry, so the gateway cannot know which
+	// capabilities they support. Skip all capability validation and let the
+	// upstream provider reject anything it doesn't support.
+	if (requestedProvider === "custom") {
+		return;
 	}
+
+	// Chat completions serve text and image output (image generation is routed
+	// through this endpoint). Any model that only produces embeddings, OCR,
+	// video, or audio belongs to a dedicated endpoint and is rejected here with
+	// a pointer to the right one.
+	validateModelOutput(modelInfo, requestedModel, ["text", "image"]);
 
 	// Validate vision capability when the request contains images.
 	// Skip this check for "auto" and "custom" models as they will be resolved dynamically.
@@ -101,6 +110,36 @@ export function validateModelCapabilities(
 				message: requestedProvider
 					? `Provider ${requestedProvider} does not support document input for model ${requestedModel}. Remove the file content or use a document-capable model.`
 					: `Model ${requestedModel} does not support document input. Remove the file content or use a document-capable model.`,
+			});
+		}
+	}
+
+	// Validate assistant prefill when the conversation ends on an assistant turn.
+	// Routing already skips mappings that declare `supportsAssistantPrefill: false`,
+	// but that filter is bypassed when the provider is pinned explicitly or the
+	// model has a single mapping, so reject here instead of letting the upstream
+	// return its own 400.
+	if (
+		hasAssistantPrefill &&
+		requestedModel !== "auto" &&
+		requestedModel !== "custom"
+	) {
+		const providersToCheck = requestedProvider
+			? modelInfo.providers.filter(
+					(p) => (p as ProviderModelMapping).providerId === requestedProvider,
+				)
+			: modelInfo.providers;
+
+		const supportsAssistantPrefill = providersToCheck.some(
+			(provider) =>
+				(provider as ProviderModelMapping).supportsAssistantPrefill !== false,
+		);
+
+		if (!supportsAssistantPrefill) {
+			throw new HTTPException(400, {
+				message: requestedProvider
+					? `Provider ${requestedProvider} does not support a conversation ending on an assistant message for model ${requestedModel}. End the conversation with a user or tool message, or use another provider.`
+					: `Model ${requestedModel} does not support a conversation ending on an assistant message. End the conversation with a user or tool message.`,
 			});
 		}
 	}
@@ -184,6 +223,30 @@ export function validateModelCapabilities(
 		}
 	}
 
+	// Check if verbosity is specified but model doesn't support it
+	// Skip this check for "auto" and "custom" models as they will be resolved dynamically
+	if (
+		verbosity !== undefined &&
+		requestedModel !== "auto" &&
+		requestedModel !== "custom"
+	) {
+		const providersToCheck = requestedProvider
+			? modelInfo.providers.filter(
+					(p) => (p as ProviderModelMapping).providerId === requestedProvider,
+				)
+			: modelInfo.providers;
+
+		const supportsVerbosity = providersToCheck.some(
+			(provider) => (provider as ProviderModelMapping).verbosity === true,
+		);
+
+		if (!supportsVerbosity) {
+			throw new HTTPException(400, {
+				message: `Model ${requestedModel} does not support the verbosity parameter. Remove the verbosity parameter or use a model that supports it (OpenAI GPT-5 and later).`,
+			});
+		}
+	}
+
 	// Check if reasoning.max_tokens is specified but model doesn't support it
 	// Skip this check for "auto" and "custom" models as they will be resolved dynamically
 	if (
@@ -197,9 +260,15 @@ export function validateModelCapabilities(
 				)
 			: modelInfo.providers;
 
+		// A mapping that thinks through a binary chat-template flag
+		// (`chatTemplateThinkingKey`) also accepts a budget: the budget is dropped
+		// and only the on/off state is conveyed, so it is not "unsupported" the way
+		// it is on a provider with no thinking control at all.
 		const reasoningMaxTokens = providersToCheck.some(
 			(provider) =>
-				(provider as ProviderModelMapping).reasoningMaxTokens === true,
+				(provider as ProviderModelMapping).reasoningMaxTokens === true ||
+				(provider as ProviderModelMapping).chatTemplateThinkingKey !==
+					undefined,
 		);
 
 		if (!reasoningMaxTokens) {

@@ -1,8 +1,14 @@
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
-import { db, tables } from "@llmgateway/db";
+import { db, eq, tables } from "@llmgateway/db";
+import { randomInt } from "@llmgateway/shared/random";
 
-import { apiAuth, isClientJsonError, redisClient } from "./config.js";
+import {
+	apiAuth,
+	isClientAuthError,
+	isClientJsonError,
+	redisClient,
+} from "./config.js";
 
 describe("isClientJsonError", () => {
 	test("matches the real Better Auth malformed-JSON messages from production", () => {
@@ -46,6 +52,21 @@ describe("isClientJsonError", () => {
 		expect(isClientJsonError("Redis pipeline execution failed", [])).toBe(
 			false,
 		);
+	});
+});
+
+describe("isClientAuthError", () => {
+	test("matches the bare signup_disabled code Better Auth logs", () => {
+		expect(isClientAuthError("signup_disabled")).toBe(true);
+		expect(isClientAuthError(" signup_disabled ")).toBe(true);
+	});
+
+	test("does not match genuine server errors", () => {
+		expect(isClientAuthError("Database connection failed")).toBe(false);
+		expect(isClientAuthError("unable_to_create_user")).toBe(false);
+		expect(
+			isClientAuthError("Failed to send verification email signup_disabled"),
+		).toBe(false);
 	});
 });
 
@@ -174,6 +195,140 @@ describe("API auth hooks functionality", () => {
 		expect(project?.name).toBe("Default Project");
 	});
 
+	test("should create personal organization for DevPass (code app) signup", async () => {
+		const codeUrl = process.env.CODE_URL ?? "http://localhost:3004";
+		const email = `test-devpass-${Date.now()}@example.com`;
+		const password = "Password123!";
+
+		// Sign up a new user with the code app as the request origin
+		const signUpResponse = await apiAuth.handler(
+			new Request("http://localhost:4002/auth/sign-up/email", {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Origin: codeUrl,
+					"CF-Connecting-IP": `192.168.30.${randomInt(0, 255)}`,
+				},
+				body: JSON.stringify({ email, password, name: "Dev User" }),
+			}),
+		);
+
+		expect(signUpResponse.status).toBe(200);
+
+		const user = await db.query.user.findFirst({
+			where: {
+				email: {
+					eq: email,
+				},
+			},
+		});
+
+		expect(user).not.toBeNull();
+
+		const userOrganization = await db.query.userOrganization.findFirst({
+			where: {
+				userId: {
+					eq: user!.id,
+				},
+			},
+			with: {
+				organization: true,
+			},
+		});
+
+		expect(userOrganization).not.toBeNull();
+		// DevPass signups get a "DevPass" org, not the shared "Default Organization"
+		expect(userOrganization?.organization?.name).toBe("DevPass");
+		expect(userOrganization?.organization?.kind).toBe("devpass");
+
+		const project = await db.query.project.findFirst({
+			where: {
+				organizationId: {
+					eq: userOrganization!.organization?.id,
+				},
+			},
+		});
+
+		expect(project).not.toBeNull();
+		expect(project?.mode).toBe("credits");
+	});
+
+	test("should create default organization when DevPass user signs in to main app", async () => {
+		const codeUrl = process.env.CODE_URL ?? "http://localhost:3004";
+		const uiUrl = process.env.UI_URL ?? "http://localhost:3002";
+		const email = `test-devpass-main-${Date.now()}@example.com`;
+		const password = "Password123!";
+
+		const signUpResponse = await apiAuth.handler(
+			new Request("http://localhost:4002/auth/sign-up/email", {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Origin: codeUrl,
+					"CF-Connecting-IP": `192.168.31.${randomInt(0, 255)}`,
+				},
+				body: JSON.stringify({ email, password, name: "Dev User" }),
+			}),
+		);
+
+		expect(signUpResponse.status).toBe(200);
+
+		const user = await db.query.user.findFirst({
+			where: {
+				email: {
+					eq: email,
+				},
+			},
+		});
+
+		expect(user).not.toBeNull();
+
+		await db
+			.update(tables.user)
+			.set({ emailVerified: true })
+			.where(eq(tables.user.id, user!.id));
+
+		const signInResponse = await apiAuth.handler(
+			new Request("http://localhost:4002/auth/sign-in/email", {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Origin: uiUrl,
+				},
+				body: JSON.stringify({ email, password }),
+			}),
+		);
+
+		expect(signInResponse.status).toBe(200);
+
+		const userOrganizations = await db.query.userOrganization.findMany({
+			where: {
+				userId: {
+					eq: user!.id,
+				},
+			},
+			with: {
+				organization: true,
+			},
+		});
+
+		const organizations = userOrganizations
+			.map((uo) => uo.organization)
+			.filter((org) => org?.status !== "deleted");
+
+		expect(organizations).toHaveLength(2);
+		expect(
+			organizations.some(
+				(org) => org?.name === "DevPass" && org.kind === "devpass",
+			),
+		).toBe(true);
+		expect(
+			organizations.some(
+				(org) => org?.name === "Default Organization" && org.kind === "default",
+			),
+		).toBe(true);
+	});
+
 	test("should automatically verify email for self-hosted installations", async () => {
 		const isHosted = process.env.HOSTED === "true";
 
@@ -191,7 +346,7 @@ describe("API auth hooks functionality", () => {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/json",
-					"CF-Connecting-IP": `192.168.10.${Math.floor(Math.random() * 255)}`,
+					"CF-Connecting-IP": `192.168.10.${randomInt(0, 255)}`,
 				},
 				body: JSON.stringify({ email, password, name: "Test User" }),
 			}),
@@ -225,7 +380,7 @@ describe("API auth hooks functionality", () => {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/json",
-					"CF-Connecting-IP": `192.168.20.${Math.floor(Math.random() * 255)}`,
+					"CF-Connecting-IP": `192.168.20.${randomInt(0, 255)}`,
 				},
 				body: JSON.stringify({ email, password }),
 			}),
@@ -250,7 +405,7 @@ describe("API auth hooks functionality", () => {
 				method: "POST",
 				headers: {
 					"Content-Type": "application/json",
-					"CF-Connecting-IP": `192.168.21.${Math.floor(Math.random() * 255)}`,
+					"CF-Connecting-IP": `192.168.21.${randomInt(0, 255)}`,
 				},
 				body: JSON.stringify({ email, password, name: "Alice Wonder" }),
 			}),

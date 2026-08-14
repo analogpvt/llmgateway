@@ -79,6 +79,7 @@ export function extractTokenUsage(
 	switch (provider) {
 		case "google-ai-studio":
 		case "glacier":
+		case "iceberg":
 		case "google-vertex":
 		case "quartz":
 			if (data.usageMetadata) {
@@ -153,6 +154,10 @@ export function extractTokenUsage(
 				// Total prompt tokens = regular input + cache read + cache write
 				promptTokens = inputTokens + cacheReadTokens + cacheWriteTokens;
 				completionTokens = data.usage.outputTokens ?? null;
+				// The Bedrock Converse API does not break out reasoning tokens; they
+				// are bundled into outputTokens (unlike the direct Anthropic API,
+				// which reports output_tokens_details.thinking_tokens). So there is
+				// no reasoningTokens source to read here.
 				// Cached tokens are the tokens read from cache (discount applies to these)
 				cachedTokens = cacheReadTokens;
 				cacheCreationTokens = cacheWriteTokens;
@@ -162,7 +167,7 @@ export function extractTokenUsage(
 			}
 			break;
 		case "anthropic":
-		case "anthropic-discount":
+		case "vertex-anthropic":
 			{
 				const usage = data.message?.usage ?? data.usage;
 				if (!usage) {
@@ -196,7 +201,14 @@ export function extractTokenUsage(
 					cacheCreation1hTokens = cacheCreation1h > 0 ? cacheCreation1h : null;
 				}
 				completionTokens = usage.output_tokens ?? null;
-				reasoningTokens = usage.reasoning_output_tokens ?? null;
+				// Anthropic reports thinking tokens under
+				// `output_tokens_details.thinking_tokens` (adaptive thinking returns
+				// an encrypted thinking block with no text, so this is the only
+				// signal that reasoning happened). Keep the legacy field as a fallback.
+				reasoningTokens =
+					usage.output_tokens_details?.thinking_tokens ??
+					usage.reasoning_output_tokens ??
+					null;
 				if (promptTokens !== null && completionTokens !== null) {
 					totalTokens = promptTokens + completionTokens;
 				}
@@ -222,6 +234,49 @@ export function extractTokenUsage(
 				}
 			}
 			break;
+		case "xai":
+			// xAI is one of the few providers whose `completion_tokens` EXCLUDES
+			// reasoning (total_tokens = prompt + completion + reasoning), so the
+			// reasoning count has to reach the cost engine to be billed at all.
+			// It only ever appears nested under `completion_tokens_details`, which
+			// the default OpenAI branch below does not read — it looks for a
+			// top-level `usage.reasoning_tokens` — so without this case every
+			// reasoning request is billed for its handful of visible output tokens
+			// and nothing else.
+			if (data.usage) {
+				promptTokens = data.usage.prompt_tokens ?? null;
+				completionTokens = data.usage.completion_tokens ?? null;
+				totalTokens = data.usage.total_tokens ?? null;
+				reasoningTokens =
+					data.usage.completion_tokens_details?.reasoning_tokens ??
+					data.usage.reasoning_tokens ??
+					null;
+				cachedTokens = data.usage.prompt_tokens_details?.cached_tokens ?? null;
+			}
+			break;
+		case "sakana":
+			// Fugu streams over Chat Completions and bills the orchestration tokens
+			// consumed by its underlying agent pool on top of the user-visible
+			// input/output tokens. They arrive in the *_tokens_details and are real
+			// billable usage, so fold them into the prompt/completion (and cached)
+			// counts the cost engine sees.
+			if (data.usage) {
+				const promptDetails = data.usage.prompt_tokens_details ?? {};
+				const completionDetails = data.usage.completion_tokens_details ?? {};
+				promptTokens =
+					(data.usage.prompt_tokens ?? 0) +
+					(promptDetails.orchestration_input_tokens ?? 0);
+				completionTokens =
+					(data.usage.completion_tokens ?? 0) +
+					(completionDetails.orchestration_output_tokens ?? 0);
+				reasoningTokens = completionDetails.reasoning_tokens ?? null;
+				cachedTokens =
+					(promptDetails.cached_tokens ?? 0) +
+					(promptDetails.orchestration_input_cached_tokens ?? 0);
+				totalTokens =
+					data.usage.total_tokens ?? promptTokens + completionTokens;
+			}
+			break;
 		default: // OpenAI format
 			if (data.response?.usage) {
 				// OpenAI Responses API format (response.completed events)
@@ -232,6 +287,13 @@ export function extractTokenUsage(
 				totalTokens = ru.total_tokens ?? null;
 				reasoningTokens = ru.output_tokens_details?.reasoning_tokens ?? null;
 				cachedTokens = ru.input_tokens_details?.cached_tokens ?? null;
+				// GPT-5.6+ bills prompt-cache writes at 1.25x and reports them in
+				// `cache_write_tokens` (a subset of input_tokens, like cached_tokens).
+				const responsesCacheWrite =
+					ru.input_tokens_details?.cache_write_tokens ?? 0;
+				if (responsesCacheWrite > 0) {
+					cacheCreationTokens = responsesCacheWrite;
+				}
 			} else if (data.usage) {
 				// Standard OpenAI Chat Completions format
 				promptTokens = data.usage.prompt_tokens ?? null;
@@ -239,6 +301,13 @@ export function extractTokenUsage(
 				totalTokens = data.usage.total_tokens ?? null;
 				reasoningTokens = data.usage.reasoning_tokens ?? null;
 				cachedTokens = data.usage.prompt_tokens_details?.cached_tokens ?? null;
+				// GPT-5.6+ bills prompt-cache writes at 1.25x and reports them in
+				// `cache_write_tokens` (a subset of prompt_tokens, like cached_tokens).
+				const chatCacheWrite =
+					data.usage.prompt_tokens_details?.cache_write_tokens ?? 0;
+				if (chatCacheWrite > 0) {
+					cacheCreationTokens = chatCacheWrite;
+				}
 			}
 			break;
 	}

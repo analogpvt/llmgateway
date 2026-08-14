@@ -19,6 +19,15 @@ export const toolFunction = z.object({
 export const functionTool = z.object({
 	type: z.literal("function"),
 	function: toolFunction,
+	// Recorded as sent: it is why the tool stayed out of the cached prompt
+	// prefix on an Anthropic upstream.
+	defer_loading: z.boolean().optional(),
+});
+
+export const toolSearchTool = z.object({
+	type: z.literal("tool_search"),
+	tool_search_type: z.string(),
+	name: z.string().optional(),
 });
 
 export const webSearchTool = z.object({
@@ -35,7 +44,7 @@ export const webSearchTool = z.object({
 	max_uses: z.number().optional(),
 });
 
-export const tool = z.union([functionTool, webSearchTool]);
+export const tool = z.union([functionTool, webSearchTool, toolSearchTool]);
 
 export const toolChoice = z.union([
 	z.literal("none"),
@@ -46,6 +55,11 @@ export const toolChoice = z.union([
 		function: z.object({
 			name: z.string(),
 		}),
+	}),
+	// Recorded as sent: it is why a search-on-demand-only provider was routable
+	// for this request, and why a web search was billed.
+	z.object({
+		type: z.literal("web_search"),
 	}),
 ]);
 
@@ -67,9 +81,52 @@ type ProjectBase = InferSelectModel<typeof tables.project>;
 type OrganizationBase = InferSelectModel<typeof tables.organization>;
 type UserBase = InferSelectModel<typeof tables.user>;
 type ApiKeyIamRuleBase = InferSelectModel<typeof tables.apiKeyIamRule>;
+type UserIamRuleBase = InferSelectModel<typeof tables.userIamRule>;
 
-export type ApiKey = Omit<ApiKeyBase, "status"> & {
+export type ApiKey = Omit<ApiKeyBase, "status" | "keyType"> & {
 	status: "active" | "inactive" | "deleted" | null;
+	keyType:
+		"user" | "platform_secret" | "platform_publishable" | "end_user_customer";
+};
+
+export type EndCustomer = Omit<
+	InferSelectModel<typeof tables.endCustomer>,
+	"status"
+> & {
+	status: "active" | "blocked" | "deleted";
+};
+
+export type EndUserSession = Omit<
+	InferSelectModel<typeof tables.endUserSession>,
+	"status"
+> & {
+	status: "active" | "inactive" | "deleted";
+};
+
+export type Wallet = Omit<InferSelectModel<typeof tables.wallet>, "status"> & {
+	status: "active" | "frozen";
+};
+
+export type WalletLedger = Omit<
+	InferSelectModel<typeof tables.walletLedger>,
+	"type"
+> & {
+	type:
+		"topup" | "bonus" | "usage_debit" | "refund" | "adjustment" | "reversal";
+};
+
+export type WebhookEndpoint = Omit<
+	InferSelectModel<typeof tables.webhookEndpoint>,
+	"status"
+> & {
+	status: "active" | "disabled";
+};
+
+export type PlatformWebhookDelivery = Omit<
+	InferSelectModel<typeof tables.platformWebhookDelivery>,
+	"status"
+> & {
+	status: "pending" | "delivered" | "failed";
 };
 
 export type Project = Omit<ProjectBase, "status" | "mode"> & {
@@ -102,6 +159,19 @@ export type ApiKeyIamRule = Omit<ApiKeyIamRuleBase, "status" | "ruleType"> & {
 	status: "active" | "inactive";
 };
 
+export type UserIamRule = Omit<UserIamRuleBase, "status" | "ruleType"> & {
+	ruleType:
+		| "allow_models"
+		| "deny_models"
+		| "allow_pricing"
+		| "deny_pricing"
+		| "allow_providers"
+		| "deny_providers"
+		| "allow_ip_cidrs"
+		| "deny_ip_cidrs";
+	status: "active" | "inactive";
+};
+
 export type LogInsertData = Omit<
 	InferInsertModel<typeof tables.log>,
 	"id" | "createdAt" | "updatedAt"
@@ -114,27 +184,47 @@ export type SerializedOrganization = Omit<
 	| "createdAt"
 	| "updatedAt"
 	| "planExpiresAt"
+	| "planStartedAt"
 	| "stripeCustomerId"
 	| "stripeSubscriptionId"
 	| "subscriptionCancelled"
 	| "trialStartDate"
 	| "trialEndDate"
-	| "isTrialActive"
 	| "paymentFailureCount"
 	| "lastPaymentFailureAt"
 	| "paymentFailureStartedAt"
 	| "devPlanBillingCycleStart"
+	| "devPlanPremiumWeekStart"
 	| "devPlanStripeSubscriptionId"
 	| "devPlanCancelled"
 	| "devPlanExpiresAt"
+	| "devPlanPendingTier"
 	| "devPlanCardFingerprint"
+	| "devPlanCreditsFrozen"
+	| "devPlanCreditsLimitBeforeFreeze"
+	| "devPlanTierChangeClaimedAt"
+	| "chatPlanBillingCycleStart"
+	| "chatPlanStripeSubscriptionId"
+	| "chatPlanCancelled"
+	| "chatPlanExpiresAt"
+	| "chatPlanCardFingerprint"
 	| "lastTopUpAmount"
+	// LLM SDK internals — not part of the dashboard-facing API surface.
+	| "endUserMarginBalance"
+	| "stripeConnectAccountId"
+	| "stripeConnectOnboarded"
 > & {
 	createdAt: string;
 	updatedAt: string;
 	planExpiresAt: string | null;
+	planStartedAt: string | null;
+	trialStartDate: string | null;
+	trialEndDate: string | null;
 	devPlanBillingCycleStart: string | null;
+	devPlanPremiumWeekStart: string | null;
 	devPlanExpiresAt: string | null;
+	chatPlanBillingCycleStart: string | null;
+	chatPlanExpiresAt: string | null;
 };
 
 export type SerializedProject = Omit<Project, "createdAt" | "updatedAt"> & {
@@ -146,15 +236,30 @@ export type SerializedUser = Pick<User, "id" | "email" | "name">;
 
 export type SerializedApiKey = Omit<
 	ApiKey,
-	"createdAt" | "updatedAt" | "currentPeriodStartedAt"
+	| "createdAt"
+	| "updatedAt"
+	| "currentPeriodStartedAt"
+	| "expiresAt"
+	// LLM SDK internals — hidden aggregate keys aren't surfaced here.
+	| "keyType"
+	| "endCustomerWalletId"
 > & {
 	createdAt: string;
 	updatedAt: string;
 	currentPeriodStartedAt: string | null;
+	expiresAt: string | null;
 };
 
 export type SerializedApiKeyIamRule = Omit<
 	ApiKeyIamRule,
+	"createdAt" | "updatedAt"
+> & {
+	createdAt: string;
+	updatedAt: string;
+};
+
+export type SerializedUserIamRule = Omit<
+	UserIamRule,
 	"createdAt" | "updatedAt"
 > & {
 	createdAt: string;

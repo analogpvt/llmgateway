@@ -20,13 +20,13 @@ const comparisonData = [
 				title: "Self-host the full platform",
 				description: "Run the entire stack on your own infrastructure",
 				llmgateway: "AGPLv3",
-				portkey: "Gateway only",
+				portkey: "Most (since 2.0)",
 			},
 			{
 				title: "Open-source license",
 				description: "What ships under an open-source license",
 				llmgateway: "Full platform (AGPLv3)",
-				portkey: "Gateway/router (MIT)",
+				portkey: "Gateway + platform (MIT)",
 			},
 			{
 				title: "One-command Docker deploy",
@@ -78,7 +78,7 @@ const comparisonData = [
 				title: "Transparent platform fee",
 				description: "Predictable, easy-to-reason-about pricing",
 				llmgateway: "5% or 0% (BYOK)",
-				portkey: "Usage/seat tiers",
+				portkey: "Usage-based tiers",
 			},
 			{
 				title: "Real-time cost analytics",
@@ -100,7 +100,7 @@ const comparisonData = [
 			{
 				title: "Model coverage",
 				description: "Models and providers available through one API",
-				llmgateway: "300+ models, 25+ providers",
+				llmgateway: "200+ models, 40+ providers",
 				portkey: "1,600+ (vendor claim)",
 			},
 			{
@@ -118,7 +118,7 @@ const comparisonData = [
 			{
 				title: "Versioned prompt management",
 				description: "Prompt registry, templates, and deployments",
-				llmgateway: "Playground only",
+				llmgateway: "Lounge only",
 				portkey: true,
 			},
 			{
@@ -272,6 +272,16 @@ export function ComparisonPortkey() {
 					<p className="text-sm text-muted-foreground mt-3">
 						No credit card required • Self-host option available • Enterprise
 						support included
+					</p>
+					<p className="text-sm text-muted-foreground mt-3">
+						Weighing more options? See the{" "}
+						<Link
+							href="/blog/portkey-alternatives"
+							className="underline underline-offset-4 hover:text-foreground"
+						>
+							8 best Portkey alternatives in 2026
+						</Link>
+						.
 					</p>
 				</div>
 			</div>

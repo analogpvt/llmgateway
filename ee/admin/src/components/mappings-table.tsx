@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useCallback, useState } from "react";
 
 import { HistoryChart } from "@/components/history-chart";
+import { TokenBreakdownCell } from "@/components/token-breakdown";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -36,7 +37,10 @@ function toHistoryWindow(pageWindow: PageWindow): HistoryWindow {
 		"12h": "12h",
 		"24h": "24h",
 		"2d": "2d",
+		"3d": "3d",
 		"7d": "7d",
+		"30d": "30d",
+		"90d": "90d",
 	};
 	return map[pageWindow] ?? "24h";
 }
@@ -71,7 +75,7 @@ function SortableHeader({
 	pageWindow?: PageWindow;
 }) {
 	const isActive = currentSortBy === sortKey;
-	const nextOrder = isActive && currentSortOrder === "asc" ? "desc" : "asc";
+	const nextOrder = isActive && currentSortOrder === "desc" ? "asc" : "desc";
 	const searchParam = search ? `&search=${encodeURIComponent(search)}` : "";
 	const windowParam = pageWindow ? `&window=${pageWindow}` : "";
 	const href = `/model-provider-mappings?sortBy=${sortKey}&sortOrder=${nextOrder}${searchParam}${windowParam}`;
@@ -206,6 +210,9 @@ function MappingRow({
 				<TableCell className="tabular-nums">
 					{formatCost(mapping.cost)}
 				</TableCell>
+				<TableCell>
+					<TokenBreakdownCell breakdown={mapping} />
+				</TableCell>
 				<TableCell className="tabular-nums">
 					{formatNumber(mapping.errorsCount)}
 				</TableCell>
@@ -254,7 +261,7 @@ function MappingRow({
 			{expanded && (
 				<TableRow>
 					<TableCell
-						colSpan={16}
+						colSpan={17}
 						className="p-4"
 						id={`mapping-history-${mapping.providerId}-${mapping.modelId}`}
 					>
@@ -309,6 +316,7 @@ export function MappingsTable({
 					<TableHead>Status</TableHead>
 					{sh("Requests", "logsCount")}
 					{sh("Cost", "cost")}
+					<TableHead>Tokens</TableHead>
 					{sh("Errors", "errorsCount")}
 					{sh("Client", "clientErrorsCount")}
 					{sh("Gateway", "gatewayErrorsCount")}
@@ -325,7 +333,7 @@ export function MappingsTable({
 				{mappings.length === 0 ? (
 					<TableRow>
 						<TableCell
-							colSpan={16}
+							colSpan={17}
 							className="h-24 text-center text-muted-foreground"
 						>
 							No mappings found

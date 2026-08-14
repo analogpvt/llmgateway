@@ -1,5 +1,6 @@
 import createFetchClient from "openapi-fetch";
 
+import { comparisons } from "@/lib/comparisons";
 import { getConfig } from "@/lib/config-server";
 
 import type { paths } from "@/lib/api/v1";
@@ -29,7 +30,7 @@ async function fetchPublicShares(): Promise<ShareListItem[]> {
 }
 
 export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
-	const baseUrl = "https://chat.llmgateway.io";
+	const baseUrl = "https://lounge.llmgateway.io";
 	const now = new Date();
 
 	const staticEntries: MetadataRoute.Sitemap = [
@@ -52,6 +53,12 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
 			priority: 0.8,
 		},
 		{
+			url: `${baseUrl}/audio`,
+			lastModified: now,
+			changeFrequency: "weekly",
+			priority: 0.8,
+		},
+		{
 			url: `${baseUrl}/group`,
 			lastModified: now,
 			changeFrequency: "weekly",
@@ -63,6 +70,24 @@ export default async function sitemap(): Promise<MetadataRoute.Sitemap> {
 			changeFrequency: "weekly",
 			priority: 0.8,
 		},
+		{
+			url: `${baseUrl}/pricing`,
+			lastModified: now,
+			changeFrequency: "weekly",
+			priority: 0.7,
+		},
+		{
+			url: `${baseUrl}/compare`,
+			lastModified: now,
+			changeFrequency: "weekly",
+			priority: 0.8,
+		},
+		...comparisons.map((comparison) => ({
+			url: `${baseUrl}/compare/${comparison.slug}`,
+			lastModified: now,
+			changeFrequency: "weekly" as const,
+			priority: 0.7,
+		})),
 	];
 
 	const shares = await fetchPublicShares();

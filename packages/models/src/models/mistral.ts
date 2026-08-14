@@ -42,6 +42,7 @@ export const mistralModels = [
 				vision: true,
 				tools: false,
 				jsonOutput: false,
+				deactivatedAt: new Date("2026-07-13"),
 			},
 		],
 	},
@@ -222,6 +223,38 @@ export const mistralModels = [
 				vision: false,
 				tools: false,
 				jsonOutput: true,
+				deactivatedAt: new Date("2026-07-13"),
+			},
+		],
+	},
+	{
+		id: "mistral-ocr-latest",
+		name: "Mistral OCR",
+		description:
+			"Mistral's OCR model that extracts text, tables, and structure from documents and images as markdown via the /v1/ocr endpoint.",
+		family: "mistral",
+		releasedAt: new Date("2025-03-06"),
+		output: ["ocr"],
+		providers: [
+			{
+				// OCR is billed per page and the Mistral key needs a separate OCR
+				// entitlement, so a key without it makes the suite fail with a 401
+				// that looks like a gateway bug. Opt in with
+				// TEST_MODELS="mistral/mistral-ocr-latest".
+				test: "skip",
+				providerId: "mistral",
+				externalId: "mistral-ocr-latest",
+				inputPrice: "0",
+				outputPrice: "0",
+				requestPrice: "0",
+				ocrPagePrice: "0.004",
+				contextSize: 0,
+				maxOutput: undefined,
+				streaming: false,
+				vision: true,
+				tools: false,
+				jsonOutput: false,
+				ocr: true,
 			},
 		],
 	},

@@ -6,12 +6,23 @@ import {
 	type Provider,
 	providers,
 } from "@llmgateway/models";
+import {
+	DYNAMIC_ROUTE_NAME_REGEX,
+	parseDynamicRouteModel,
+} from "@llmgateway/shared/dynamic-route";
 
 export interface ParseModelInputResult {
 	requestedModel: Model;
 	requestedProvider: Provider | undefined;
 	customProviderName: string | undefined;
 	requestedRegion: string | undefined;
+	/**
+	 * Set when the model input invokes a named dynamic route
+	 * (e.g. "dynamic/support"). The request piggybacks the "auto" placeholder
+	 * model until the route graph is evaluated later in the chat handler,
+	 * where project/org context is available.
+	 */
+	dynamicRouteName?: string;
 }
 
 /**
@@ -19,6 +30,7 @@ export interface ParseModelInputResult {
  *
  * Handles various input formats:
  * - "auto" or "custom" -> llmgateway provider
+ * - "dynamic/<name>" -> named dynamic route (deferred evaluation)
  * - "provider/model" -> specific provider and model
  * - "provider/model:region" -> specific provider, model, and region
  * - "customProvider/model" -> custom provider with any model name
@@ -31,6 +43,22 @@ export function parseModelInput(modelInput: string): ParseModelInputResult {
 	let requestedProvider: Provider | undefined;
 	let customProviderName: string | undefined;
 	let requestedRegion: string | undefined;
+
+	const dynamicRouteName = parseDynamicRouteModel(modelInput);
+	if (dynamicRouteName !== undefined) {
+		if (!DYNAMIC_ROUTE_NAME_REGEX.test(dynamicRouteName)) {
+			throw new HTTPException(400, {
+				message: `Invalid dynamic route name "${dynamicRouteName}"`,
+			});
+		}
+		return {
+			requestedModel: "auto" as Model,
+			requestedProvider: "llmgateway",
+			customProviderName: undefined,
+			requestedRegion: undefined,
+			dynamicRouteName,
+		};
+	}
 
 	// check if there is an exact model match
 	if (modelInput === "auto" || modelInput === "custom") {
@@ -72,15 +100,8 @@ export function parseModelInput(modelInput: string): ParseModelInputResult {
 					m.providers.some((p) => p.providerId === requestedProvider),
 			);
 
-			// Fall back to matching by model name only
+			// Fall back to matching by catalog id only
 			modelDef ??= models.find((m) => m.id === modelName);
-
-			modelDef ??= models.find((m) =>
-				m.providers.some(
-					(p) =>
-						p.externalId === modelName && p.providerId === requestedProvider,
-				),
-			);
 
 			if (!modelDef) {
 				throw new HTTPException(400, {
@@ -94,24 +115,15 @@ export function parseModelInput(modelInput: string): ParseModelInputResult {
 				});
 			}
 
-			const providerMapping = modelDef.providers.find(
-				(p) => p.providerId === requestedProvider,
-			);
-			requestedModel = (providerMapping?.externalId ?? modelName) as Model;
+			// Use the canonical catalog id, never the upstream externalId: two
+			// catalog entries (e.g. a free and a paid sibling) can share the same
+			// externalId, so collapsing to externalId here would let downstream
+			// resolution pick the wrong entry. The upstream externalId is derived
+			// separately from the selected provider mapping at request time.
+			requestedModel = modelDef.id as Model;
 		}
 	} else if (models.find((m) => m.id === modelInput)) {
 		requestedModel = modelInput as Model;
-	} else if (
-		models.find((m) => m.providers.find((p) => p.externalId === modelInput))
-	) {
-		const model = models.find((m) =>
-			m.providers.find((p) => p.externalId === modelInput),
-		);
-		const provider = model?.providers.find((p) => p.externalId === modelInput);
-
-		throw new HTTPException(400, {
-			message: `Model ${modelInput} must be requested with a provider prefix. Use the format: ${provider?.providerId}/${model?.id}`,
-		});
 	} else {
 		throw new HTTPException(400, {
 			message: `Requested model ${modelInput} not supported`,

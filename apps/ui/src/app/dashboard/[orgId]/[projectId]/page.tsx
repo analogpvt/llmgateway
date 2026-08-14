@@ -1,9 +1,8 @@
 import { subDays, format } from "date-fns";
-import { cookies } from "next/headers";
+import { redirect } from "next/navigation";
 
 import { DashboardClient } from "@/components/dashboard/dashboard-client";
-import { DEVPASS_CARD_COLLAPSED_COOKIE } from "@/lib/cookies";
-import { fetchServerData } from "@/lib/server-api";
+import { fetchServerData, getOrganizations } from "@/lib/server-api";
 
 import type { ActivitT } from "@/types/activity";
 
@@ -18,7 +17,7 @@ export default async function Dashboard({
 		to?: string;
 	}>;
 }) {
-	const { projectId } = await params;
+	const { orgId, projectId } = await params;
 	const searchParamsData = searchParams ? await searchParams : {};
 
 	const today = new Date();
@@ -26,7 +25,9 @@ export default async function Dashboard({
 		searchParamsData?.from ?? format(subDays(today, 6), "yyyy-MM-dd");
 	const toParam = searchParamsData?.to ?? format(today, "yyyy-MM-dd");
 
-	const initialActivityData = await fetchServerData<ActivitT>(
+	const orgsDataPromise = getOrganizations();
+
+	const initialActivityDataPromise = fetchServerData<ActivitT>(
 		"GET",
 		"/activity",
 		{
@@ -40,14 +41,17 @@ export default async function Dashboard({
 		},
 	);
 
-	const cookieStore = await cookies();
-	const devPassCollapsed =
-		cookieStore.get(DEVPASS_CARD_COLLAPSED_COOKIE)?.value === "1";
+	// Project-scoped "developer" members don't get the project-wide dashboard —
+	// send them to their personal usage view.
+	const orgsData = await orgsDataPromise;
+	const role = orgsData?.organizations?.find((o) => o.id === orgId)?.role;
+	if (role === "developer") {
+		redirect(`/dashboard/${orgId}/${projectId}/me`);
+	}
+
+	const initialActivityData = await initialActivityDataPromise;
 
 	return (
-		<DashboardClient
-			initialActivityData={initialActivityData ?? undefined}
-			initialDevPassCollapsed={devPassCollapsed}
-		/>
+		<DashboardClient initialActivityData={initialActivityData ?? undefined} />
 	);
 }

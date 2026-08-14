@@ -66,6 +66,33 @@ export default function Footer() {
 							</span>
 							All systems operational
 						</a>
+						<div className="mt-6 flex items-center gap-3">
+							{/* Per AICPA guidelines the SOC logo must link to aicpa.org/soc4so */}
+							<a
+								href="https://www.aicpa.org/soc4so"
+								target="_blank"
+								rel="noopener noreferrer"
+							>
+								<img
+									src="/badges/aicpa-soc.png"
+									alt="AICPA SOC for Service Organizations badge"
+									width={56}
+									height={56}
+									loading="lazy"
+									className="h-14 w-14"
+								/>
+							</a>
+							<a
+								href="https://security.llmgateway.io/"
+								target="_blank"
+								rel="noopener noreferrer"
+								className="text-xs leading-snug text-muted-foreground transition-colors hover:text-foreground"
+							>
+								SOC 2 Type II
+								<br />
+								compliant
+							</a>
+						</div>
 					</div>
 
 					<div className="w-full md:w-auto grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-8 text-muted-foreground">
@@ -81,6 +108,24 @@ export default function Footer() {
 									>
 										Features
 									</a>
+								</li>
+								<li>
+									<Link
+										href="/products/ai-gateway"
+										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
+										prefetch={true}
+									>
+										AI Gateway
+									</Link>
+								</li>
+								<li>
+									<Link
+										href="/products/observability"
+										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
+										prefetch={true}
+									>
+										Observability
+									</Link>
 								</li>
 								<li>
 									<Link
@@ -101,14 +146,31 @@ export default function Footer() {
 									</Link>
 								</li>
 								<li>
-									<a
-										href={config.playgroundUrl}
+									<Link
+										href="/rankings"
 										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
-										rel="noopener"
-										target="_blank"
+										prefetch={true}
 									>
-										Chat Playground
-									</a>
+										Rankings
+									</Link>
+								</li>
+								<li>
+									<Link
+										href="/add-provider"
+										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
+										prefetch={true}
+									>
+										Add Provider
+									</Link>
+								</li>
+								<li>
+									<Link
+										href="/products/lounge"
+										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
+										prefetch={true}
+									>
+										Lounge
+									</Link>
 								</li>
 								<li>
 									<Link
@@ -120,12 +182,13 @@ export default function Footer() {
 									</Link>
 								</li>
 								<li>
-									<a
-										href="https://devpass.llmgateway.io"
+									<Link
+										href="/products/devpass"
 										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
+										prefetch={true}
 									>
 										DevPass
-									</a>
+									</Link>
 								</li>
 								<li>
 									<Link
@@ -191,6 +254,15 @@ export default function Footer() {
 								</li>
 								<li>
 									<Link
+										href="/use-cases"
+										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
+										prefetch
+									>
+										Use Cases
+									</Link>
+								</li>
+								<li>
+									<Link
 										href="/blog"
 										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
 									>
@@ -244,6 +316,15 @@ export default function Footer() {
 								</li>
 								<li>
 									<Link
+										href="/copilot-cost-calculator"
+										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
+										prefetch
+									>
+										Copilot Cost Calculator
+									</Link>
+								</li>
+								<li>
+									<Link
 										href="/referrals"
 										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
 									>
@@ -261,6 +342,26 @@ export default function Footer() {
 								</li>
 								<li>
 									<a
+										href={config.discordUrl}
+										target="_blank"
+										rel="noopener noreferrer"
+										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
+									>
+										Discord
+									</a>
+								</li>
+								<li>
+									<a
+										href={config.twitterUrl}
+										target="_blank"
+										rel="noopener noreferrer"
+										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
+									>
+										Twitter
+									</a>
+								</li>
+								<li>
+									<a
 										href="mailto:contact@llmgateway.io"
 										target="_blank"
 										rel="noreferrer noopener"
@@ -274,27 +375,74 @@ export default function Footer() {
 
 						<div>
 							<h3 className="font-display text-sm font-semibold mb-4 text-foreground">
-								Community
+								Compliance
 							</h3>
 							<ul className="space-y-2">
 								<li>
 									<a
-										href={config.twitterUrl}
+										href="https://security.llmgateway.io/"
 										target="_blank"
 										rel="noopener noreferrer"
 										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
 									>
-										Twitter
+										Trust Center
 									</a>
 								</li>
 								<li>
 									<a
-										href={config.discordUrl}
+										href="https://security.llmgateway.io/"
 										target="_blank"
 										rel="noopener noreferrer"
 										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
 									>
-										Discord
+										Security Portal
+									</a>
+								</li>
+								<li>
+									<Link
+										href="/legal/terms"
+										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
+										prefetch={true}
+									>
+										Terms
+									</Link>
+								</li>
+								<li>
+									<Link
+										href="/legal/privacy"
+										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
+										prefetch={true}
+									>
+										Privacy Policy
+									</Link>
+								</li>
+								<li>
+									<Link
+										href="/legal/privacy"
+										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
+										prefetch={true}
+									>
+										GDPR
+									</Link>
+								</li>
+								<li>
+									<a
+										href="https://security.llmgateway.io/"
+										target="_blank"
+										rel="noopener noreferrer"
+										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
+									>
+										SOC 2 Type II
+									</a>
+								</li>
+								<li>
+									<a
+										href="https://status.llmgateway.io/"
+										target="_blank"
+										rel="noopener noreferrer"
+										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
+									>
+										Status
 									</a>
 								</li>
 							</ul>
@@ -305,6 +453,24 @@ export default function Footer() {
 								Compare
 							</h3>
 							<ul className="space-y-2">
+								<li>
+									<Link
+										href="/compare"
+										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
+										prefetch={true}
+									>
+										All Comparisons
+									</Link>
+								</li>
+								<li>
+									<Link
+										href="/compare/github-copilot"
+										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
+										prefetch={true}
+									>
+										GitHub Copilot
+									</Link>
+								</li>
 								<li>
 									<Link
 										href="/compare/open-router"
@@ -330,6 +496,33 @@ export default function Footer() {
 										prefetch={true}
 									>
 										Portkey
+									</Link>
+								</li>
+								<li>
+									<Link
+										href="/compare/aws-bedrock"
+										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
+										prefetch={true}
+									>
+										AWS Bedrock
+									</Link>
+								</li>
+								<li>
+									<Link
+										href="/compare/azure-ai-foundry"
+										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
+										prefetch={true}
+									>
+										Azure AI Foundry
+									</Link>
+								</li>
+								<li>
+									<Link
+										href="/compare/vercel-ai-gateway"
+										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
+										prefetch={true}
+									>
+										Vercel AI Gateway
 									</Link>
 								</li>
 								<li>
@@ -439,6 +632,78 @@ export default function Footer() {
 										Discounted
 									</Link>
 								</li>
+								<li>
+									<Link
+										href="/models/roleplay"
+										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
+										prefetch={true}
+									>
+										Best for Roleplay
+									</Link>
+								</li>
+								<li>
+									<Link
+										href="/models/coding"
+										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
+										prefetch={true}
+									>
+										Best for Coding
+									</Link>
+								</li>
+								<li>
+									<Link
+										href="/models/creative-writing"
+										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
+										prefetch={true}
+									>
+										Best for Creative Writing
+									</Link>
+								</li>
+								<li>
+									<Link
+										href="/models/translation"
+										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
+										prefetch={true}
+									>
+										Best for Translation
+									</Link>
+								</li>
+								<li>
+									<Link
+										href="/models/math"
+										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
+										prefetch={true}
+									>
+										Best for Math
+									</Link>
+								</li>
+								<li>
+									<Link
+										href="/models/long-context"
+										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
+										prefetch={true}
+									>
+										Long Context
+									</Link>
+								</li>
+								<li>
+									<Link
+										href="/models/cheapest"
+										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
+										prefetch={true}
+									>
+										Cheapest
+									</Link>
+								</li>
+								<li>
+									<Link
+										href="/models/open-source"
+										className="text-sm hover:underline underline-offset-4 hover:text-foreground"
+										prefetch={true}
+									>
+										Open Source
+									</Link>
+								</li>
 							</ul>
 						</div>
 
@@ -468,22 +733,6 @@ export default function Footer() {
 					<p className="text-muted-foreground text-sm">
 						&copy; {new Date().getFullYear()} LLM Gateway. All rights reserved.
 					</p>
-					<div className="flex items-center gap-6">
-						<Link
-							href="/legal/privacy"
-							className="text-sm text-muted-foreground hover:underline underline-offset-4 hover:text-foreground"
-							prefetch={true}
-						>
-							Privacy Policy
-						</Link>
-						<Link
-							href="/legal/terms"
-							className="text-sm text-muted-foreground hover:underline underline-offset-4 hover:text-foreground"
-							prefetch={true}
-						>
-							Terms of Use
-						</Link>
-					</div>
 				</div>
 			</div>
 		</footer>

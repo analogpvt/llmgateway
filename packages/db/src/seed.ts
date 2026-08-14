@@ -1,6 +1,11 @@
-import { randomInt as cryptoRandomInt, randomUUID } from "crypto";
+import {
+	randomBytes,
+	randomInt as cryptoRandomInt,
+	randomUUID,
+	scrypt,
+} from "crypto";
 
-import { redisClient } from "@llmgateway/cache";
+import { redisClient, storageRedisClient } from "@llmgateway/cache";
 import {
 	models as allModels,
 	providers as allProviders,
@@ -73,14 +78,49 @@ function daysAgo(days: number) {
 	/* eslint-enable no-mixed-operators */
 }
 
+function daysFromNow(days: number) {
+	/* eslint-disable no-mixed-operators */
+	return new Date(Date.now() + days * 24 * 60 * 60 * 1000);
+	/* eslint-enable no-mixed-operators */
+}
+
 function hoursAgo(hours: number) {
 	/* eslint-disable no-mixed-operators */
 	return new Date(Date.now() - hours * 60 * 60 * 1000);
 	/* eslint-enable no-mixed-operators */
 }
 
-const PASSWORD_HASH =
-	"c11ef27a7f9264be08db228ebb650888:a4d985a9c6bd98608237fd507534424950aa7fc255930d972242b81cbe78594f8568feb0d067e95ddf7be242ad3e9d013f695f4414fce68bfff091079f1dc460";
+// Every seeded account uses its own email address as its plaintext password
+// (e.g. log in as admin@example.com with the password "admin@example.com").
+// This replicates better-auth's default scrypt hashing (@better-auth/utils
+// v0.4.1, node impl) so the stored hash verifies against that plaintext at
+// login. Keep these parameters in sync with better-auth if it ever changes.
+const SCRYPT_CONFIG = { N: 16384, r: 16, p: 1, dkLen: 64 } as const;
+
+function hashPassword(password: string): Promise<string> {
+	const salt = randomBytes(16).toString("hex");
+	return new Promise((resolve, reject) => {
+		scrypt(
+			password.normalize("NFKC"),
+			salt,
+			SCRYPT_CONFIG.dkLen,
+			{
+				N: SCRYPT_CONFIG.N,
+				r: SCRYPT_CONFIG.r,
+				p: SCRYPT_CONFIG.p,
+
+				maxmem: 128 * SCRYPT_CONFIG.N * SCRYPT_CONFIG.r * 2,
+			},
+			(err, key) => {
+				if (err) {
+					reject(err);
+				} else {
+					resolve(`${salt}:${key.toString("hex")}`);
+				}
+			},
+		);
+	});
+}
 
 const MODELS = [
 	{
@@ -187,6 +227,8 @@ function weightedRandomChoice<T extends { weight: number }>(arr: T[]): T {
 	return arr[arr.length - 1]!;
 }
 
+// Each of these users can log in with their email as both username AND password
+// (password == email). See hashPassword() above.
 const EXTRA_USERS = [
 	{ id: "user-alice", name: "Alice Chen", email: "alice.chen@techcorp.io" },
 	{ id: "user-bob", name: "Bob Martinez", email: "bob@startupinc.com" },
@@ -216,8 +258,13 @@ const EXTRA_ORGS: Array<{
 	credits: number;
 	devPlan: "none" | "lite" | "pro" | "max";
 	status: "active" | "inactive";
-	isPersonal: boolean;
+	kind: "default" | "chat" | "devpass";
 	createdAt: Date;
+	// Enterprise contract window, so the dashboard countdown and the admin
+	// panel have terms in every urgency band to render.
+	planTermDays?: { started: number; endsIn: number };
+	// Active enterprise trial, so the trial countdown has data to render.
+	trialDays?: { started: number; endsIn: number };
 }> = [
 	{
 		id: "org-techcorp",
@@ -227,7 +274,7 @@ const EXTRA_ORGS: Array<{
 		credits: 450,
 		devPlan: "none",
 		status: "active",
-		isPersonal: false,
+		kind: "default",
 		createdAt: daysAgo(180),
 	},
 	{
@@ -238,7 +285,7 @@ const EXTRA_ORGS: Array<{
 		credits: 12,
 		devPlan: "lite",
 		status: "active",
-		isPersonal: false,
+		kind: "default",
 		createdAt: daysAgo(90),
 	},
 	{
@@ -249,8 +296,9 @@ const EXTRA_ORGS: Array<{
 		credits: 5200,
 		devPlan: "none",
 		status: "active",
-		isPersonal: false,
+		kind: "default",
 		createdAt: daysAgo(365),
+		planTermDays: { started: 347, endsIn: 18 },
 	},
 	{
 		id: "org-cloudnative",
@@ -260,7 +308,7 @@ const EXTRA_ORGS: Array<{
 		credits: 180,
 		devPlan: "pro",
 		status: "active",
-		isPersonal: false,
+		kind: "default",
 		createdAt: daysAgo(150),
 	},
 	{
@@ -271,8 +319,9 @@ const EXTRA_ORGS: Array<{
 		credits: 3400,
 		devPlan: "none",
 		status: "active",
-		isPersonal: false,
+		kind: "default",
 		createdAt: daysAgo(270),
+		planTermDays: { started: 361, endsIn: 4 },
 	},
 	{
 		id: "org-webagency",
@@ -282,7 +331,7 @@ const EXTRA_ORGS: Array<{
 		credits: 0,
 		devPlan: "none",
 		status: "active",
-		isPersonal: false,
+		kind: "default",
 		createdAt: daysAgo(45),
 	},
 	{
@@ -293,8 +342,9 @@ const EXTRA_ORGS: Array<{
 		credits: 8900,
 		devPlan: "max",
 		status: "active",
-		isPersonal: false,
+		kind: "default",
 		createdAt: daysAgo(400),
+		planTermDays: { started: 165, endsIn: 200 },
 	},
 	{
 		id: "org-robotics",
@@ -304,7 +354,7 @@ const EXTRA_ORGS: Array<{
 		credits: 320,
 		devPlan: "pro",
 		status: "active",
-		isPersonal: false,
+		kind: "default",
 		createdAt: daysAgo(200),
 	},
 	{
@@ -315,7 +365,7 @@ const EXTRA_ORGS: Array<{
 		credits: 560,
 		devPlan: "none",
 		status: "active",
-		isPersonal: false,
+		kind: "default",
 		createdAt: daysAgo(120),
 	},
 	{
@@ -326,7 +376,7 @@ const EXTRA_ORGS: Array<{
 		credits: 3,
 		devPlan: "lite",
 		status: "active",
-		isPersonal: false,
+		kind: "default",
 		createdAt: daysAgo(60),
 	},
 	{
@@ -337,7 +387,7 @@ const EXTRA_ORGS: Array<{
 		credits: 210,
 		devPlan: "none",
 		status: "active",
-		isPersonal: false,
+		kind: "default",
 		createdAt: daysAgo(300),
 	},
 	{
@@ -348,7 +398,7 @@ const EXTRA_ORGS: Array<{
 		credits: 7,
 		devPlan: "none",
 		status: "inactive",
-		isPersonal: false,
+		kind: "default",
 		createdAt: daysAgo(500),
 	},
 	{
@@ -359,8 +409,9 @@ const EXTRA_ORGS: Array<{
 		credits: 12500,
 		devPlan: "max",
 		status: "active",
-		isPersonal: false,
+		kind: "default",
 		createdAt: daysAgo(450),
+		trialDays: { started: 18, endsIn: 12 },
 	},
 	{
 		id: "org-analytics",
@@ -370,7 +421,7 @@ const EXTRA_ORGS: Array<{
 		credits: 140,
 		devPlan: "pro",
 		status: "active",
-		isPersonal: false,
+		kind: "default",
 		createdAt: daysAgo(80),
 	},
 	{
@@ -381,7 +432,7 @@ const EXTRA_ORGS: Array<{
 		credits: 1,
 		devPlan: "none",
 		status: "active",
-		isPersonal: false,
+		kind: "default",
 		createdAt: daysAgo(30),
 	},
 	{
@@ -392,7 +443,7 @@ const EXTRA_ORGS: Array<{
 		credits: 25,
 		devPlan: "pro",
 		status: "active",
-		isPersonal: true,
+		kind: "devpass",
 		createdAt: daysAgo(100),
 	},
 	{
@@ -403,7 +454,7 @@ const EXTRA_ORGS: Array<{
 		credits: 8,
 		devPlan: "lite",
 		status: "active",
-		isPersonal: true,
+		kind: "devpass",
 		createdAt: daysAgo(70),
 	},
 	{
@@ -414,7 +465,7 @@ const EXTRA_ORGS: Array<{
 		credits: 50,
 		devPlan: "max",
 		status: "active",
-		isPersonal: true,
+		kind: "devpass",
 		createdAt: daysAgo(55),
 	},
 ];
@@ -985,6 +1036,7 @@ const AGENT_SOURCES: Array<{ source: string; weight: number }> = [
 	{ source: "cline", weight: 0.15 },
 	{ source: "codex", weight: 0.1 },
 	{ source: "opencode", weight: 0.1 },
+	{ source: "empryo", weight: 0.08 },
 	{ source: "autohand", weight: 0.06 },
 	{ source: "n8n", weight: 0.04 },
 ];
@@ -1051,6 +1103,7 @@ function generateProjectHourlySourceStats(projects: ProjectDef[]) {
 					imageInputCost: 0,
 					imageOutputCost: 0,
 					audioInputCost: 0,
+					audioOutputCost: 0,
 					videoOutputCost: 0,
 					cachedInputCost: 0,
 					cacheWriteInputCost: 0,
@@ -1176,10 +1229,6 @@ function generateSeedModelProviderMappings() {
 					p.webSearchPrice !== undefined && p.webSearchPrice !== null
 						? String(p.webSearchPrice)
 						: null,
-				discount:
-					p.discount !== undefined && p.discount !== null
-						? String(p.discount)
-						: "0",
 				stability: p.stability ?? "stable",
 				supportedParameters: p.supportedParameters ?? null,
 				test: p.test ?? null,
@@ -1201,11 +1250,12 @@ function generateSeedModelProviderMappings() {
 	return mappings;
 }
 
-function generateSeedModelProviderMappingHistory(
+// Pick one mapping per provider (up to `limit`) so every provider has
+// history data without seeding every mapping.
+function selectTopMappingsPerProvider(
 	mappings: Array<Record<string, any>>,
+	limit: number,
 ) {
-	const history: Array<Record<string, any>> = [];
-	// Pick one mapping per provider to ensure all providers have history data
 	const seenProviders = new Set<string>();
 	const topMappings: Array<Record<string, any>> = [];
 	for (const m of mappings) {
@@ -1213,10 +1263,18 @@ function generateSeedModelProviderMappingHistory(
 			seenProviders.add(m.providerId);
 			topMappings.push(m);
 		}
-		if (topMappings.length >= 50) {
+		if (topMappings.length >= limit) {
 			break;
 		}
 	}
+	return topMappings;
+}
+
+function generateSeedModelProviderMappingHistory(
+	mappings: Array<Record<string, any>>,
+) {
+	const history: Array<Record<string, any>> = [];
+	const topMappings = selectTopMappingsPerProvider(mappings, 50);
 	for (const mapping of topMappings) {
 		for (let i = 0; i < 144; i++) {
 			const ts = minutesAgo(i * 10);
@@ -1243,6 +1301,8 @@ function generateSeedModelProviderMappingHistory(
 				totalDuration: logs * randomInt(200, 5000),
 				totalTimeToFirstToken: logs * randomInt(50, 500),
 				totalTimeToFirstReasoningToken: 0,
+				timeToFirstTokenCount: logs,
+				timeToFirstReasoningTokenCount: 0,
 			});
 		}
 	}
@@ -1276,6 +1336,111 @@ function generateSeedModelHistory() {
 				totalDuration: logCount * randomInt(200, 5000),
 				totalTimeToFirstToken: logCount * randomInt(50, 500),
 				totalTimeToFirstReasoningToken: 0,
+				timeToFirstTokenCount: logCount,
+				timeToFirstReasoningTokenCount: 0,
+			});
+		}
+	}
+	return history;
+}
+
+// 60 days of hourly per-model rollups so long-window surfaces (the public
+// rankings page, 7d/30d stats windows and their previous-window trend
+// comparison) have data locally. 60 days covers the 30d window plus the
+// equal-length previous window its trend compares against. Each model gets a
+// rank-weighted volume with a per-model daily growth factor so trends differ
+// realistically.
+const HISTORY_HOURLY_DAYS = 60;
+
+function hourlyModelVolume(rankIndex: number, hoursBack: number) {
+	/* eslint-disable no-mixed-operators */
+	const baseTokensPerHour = Math.round(2_000_000 / (rankIndex + 1) ** 0.85);
+	// Daily growth between roughly -4.5% and +4.5% depending on the model, so
+	// some models trend up and others down over the window.
+	const dailyGrowth = 1 + ((rankIndex % 7) - 3) * 0.015;
+	const daysBack = hoursBack / 24;
+	const trend = dailyGrowth ** -daysBack;
+	const noise = 0.7 + secureRandom() * 0.6;
+	return Math.max(1, Math.round(baseTokensPerHour * trend * noise));
+	/* eslint-enable no-mixed-operators */
+}
+
+function generateSeedModelHistoryHourly() {
+	const history: Array<Record<string, any>> = [];
+	const topModels = (allModels as readonly ModelDefinition[]).slice(0, 50);
+	for (const [mi, m] of topModels.entries()) {
+		for (let h = 0; h < HISTORY_HOURLY_DAYS * 24; h++) {
+			const ts = hoursAgo(h);
+			ts.setMinutes(0, 0, 0);
+			const totalTokens = hourlyModelVolume(mi, h);
+			const inputTokens = Math.round(totalTokens * 0.7);
+			const outputTokens = Math.round(totalTokens * 0.25);
+			const logs = Math.max(1, Math.round(totalTokens / 1200));
+			const errors = randomInt(0, Math.max(1, Math.floor(logs * 0.02)));
+			history.push({
+				id: `mhh-${m.id}-${h}`,
+				modelId: m.id,
+				hourTimestamp: ts,
+				logsCount: logs,
+				errorsCount: errors,
+				clientErrorsCount: Math.floor(errors * 0.3),
+				gatewayErrorsCount: Math.floor(errors * 0.1),
+				upstreamErrorsCount: Math.floor(errors * 0.6),
+				cachedCount: randomInt(0, Math.floor(logs * 0.15)),
+				totalInputTokens: inputTokens,
+				totalOutputTokens: outputTokens,
+				totalTokens,
+				totalReasoningTokens: totalTokens - inputTokens - outputTokens,
+				totalCachedTokens: randomInt(0, Math.floor(inputTokens * 0.3)),
+				totalDuration: logs * randomInt(500, 5000),
+				totalTimeToFirstToken: logs * randomInt(100, 800),
+				totalTimeToFirstReasoningToken: 0,
+				timeToFirstTokenCount: logs,
+				timeToFirstReasoningTokenCount: 0,
+			});
+		}
+	}
+	return history;
+}
+
+function generateSeedModelProviderMappingHistoryHourly(
+	mappings: Array<Record<string, any>>,
+) {
+	const history: Array<Record<string, any>> = [];
+	// Same one-mapping-per-provider selection as the minute-level seed so every
+	// provider has long-window data too.
+	const topMappings = selectTopMappingsPerProvider(mappings, 50);
+	for (const [mi, mapping] of topMappings.entries()) {
+		for (let h = 0; h < HISTORY_HOURLY_DAYS * 24; h++) {
+			const ts = hoursAgo(h);
+			ts.setMinutes(0, 0, 0);
+			const totalTokens = hourlyModelVolume(mi, h);
+			const inputTokens = Math.round(totalTokens * 0.7);
+			const outputTokens = Math.round(totalTokens * 0.25);
+			const logs = Math.max(1, Math.round(totalTokens / 1200));
+			const errors = randomInt(0, Math.max(1, Math.floor(logs * 0.02)));
+			history.push({
+				id: `mpmhh-${mapping.id}-${h}`,
+				modelId: mapping.modelId,
+				providerId: mapping.providerId,
+				modelProviderMappingId: mapping.id,
+				hourTimestamp: ts,
+				logsCount: logs,
+				errorsCount: errors,
+				clientErrorsCount: Math.floor(errors * 0.3),
+				gatewayErrorsCount: Math.floor(errors * 0.1),
+				upstreamErrorsCount: Math.floor(errors * 0.6),
+				cachedCount: randomInt(0, Math.floor(logs * 0.15)),
+				totalInputTokens: inputTokens,
+				totalOutputTokens: outputTokens,
+				totalTokens,
+				totalReasoningTokens: totalTokens - inputTokens - outputTokens,
+				totalCachedTokens: randomInt(0, Math.floor(inputTokens * 0.3)),
+				totalDuration: logs * randomInt(500, 5000),
+				totalTimeToFirstToken: logs * randomInt(100, 800),
+				totalTimeToFirstReasoningToken: 0,
+				timeToFirstTokenCount: logs,
+				timeToFirstReasoningTokenCount: 0,
 			});
 		}
 	}
@@ -1293,6 +1458,7 @@ async function seed() {
 	await upsert(tables.user, {
 		id: "test-user-id",
 		name: "Test User",
+		// Login: admin@example.com / admin@example.com (password == email)
 		email: "admin@example.com",
 		emailVerified: true,
 	});
@@ -1301,7 +1467,7 @@ async function seed() {
 		id: "test-account-id",
 		providerId: "credential",
 		accountId: "test-account-id",
-		password: PASSWORD_HASH,
+		password: await hashPassword("admin@example.com"),
 		userId: "test-user-id",
 	});
 
@@ -1334,15 +1500,90 @@ async function seed() {
 		createdBy: "test-user-id",
 	});
 
+	// Sibling org for the test admin with data retention disabled, so
+	// retention-off behavior (e.g. the Responses API without stored log
+	// payloads) can be exercised locally while the default Test Organization
+	// stays on "retain" for easier debugging.
+	await upsert(tables.organization, {
+		id: "test-no-retention-org-id",
+		name: "Test No Retention Organization",
+		billingEmail: "admin@example.com",
+		credits: 5,
+		retentionLevel: "none",
+	});
+
+	await upsert(tables.userOrganization, {
+		id: "test-no-retention-user-org-id",
+		userId: "test-user-id",
+		organizationId: "test-no-retention-org-id",
+		role: "owner",
+	});
+
+	await upsert(tables.project, {
+		id: "test-no-retention-project-id",
+		name: "Test No Retention Project",
+		organizationId: "test-no-retention-org-id",
+		mode: "hybrid",
+	});
+
+	await upsert(tables.apiKey, {
+		id: "test-no-retention-api-key-id",
+		token: "test-token-no-retention",
+		projectId: "test-no-retention-project-id",
+		description: "Test API Key (no data retention)",
+		createdBy: "test-user-id",
+	});
+
+	// Embeddable Payments SDK POC: a project with the SDK enabled and a 50%
+	// end-user top-up bonus, plus a live platform secret key, so the end-user
+	// wallet + bonus flow can be exercised end-to-end locally (mint a session with
+	// the platform secret, top up as an end-user, get +50% credit). The bonus is
+	// funded from this org's credit balance, so it is seeded with credits.
+	await upsert(tables.organization, {
+		id: "sdk-poc-org-id",
+		name: "Payments SDK POC",
+		billingEmail: "admin@example.com",
+		credits: 100,
+		retentionLevel: "retain",
+	});
+
+	await upsert(tables.userOrganization, {
+		id: "sdk-poc-user-org-id",
+		userId: "test-user-id",
+		organizationId: "sdk-poc-org-id",
+		role: "owner",
+	});
+
+	await upsert(tables.project, {
+		id: "sdk-poc-project-id",
+		name: "Payments SDK POC",
+		organizationId: "sdk-poc-org-id",
+		mode: "credits",
+		paymentsSdkEnabled: true,
+		endUserEnabled: true,
+		endUserTopUpBonusPercent: "50",
+	});
+
+	// Live-mode platform secret (token does not start with `sk_test_`), so minted
+	// sessions/wallets are live and eligible for the developer-funded bonus.
+	await upsert(tables.apiKey, {
+		id: "sdk-poc-platform-secret-id",
+		token: "sk_pocbonus_live_secret",
+		projectId: "sdk-poc-project-id",
+		description: "Payments SDK POC platform secret",
+		keyType: "platform_secret",
+		createdBy: "test-user-id",
+	});
+
 	// Personal org for the test admin so DevPass Pro is available locally
 	await upsert(tables.organization, {
 		id: "test-personal-org-id",
 		name: "Test User's Workspace",
 		billingEmail: "admin@example.com",
 		credits: 0,
-		retentionLevel: "retain",
+		retentionLevel: "none",
 		plan: "free",
-		isPersonal: true,
+		kind: "devpass",
 		devPlan: "pro",
 		devPlanCycle: "monthly",
 		devPlanCreditsUsed: "0",
@@ -1523,6 +1764,19 @@ async function seed() {
 			],
 		},
 		{
+			source: "empryo",
+			weight: 0.02,
+			models: [
+				{ model: "claude-3.5-sonnet", provider: "anthropic", weight: 0.55 },
+				{
+					model: "gemini-2.0-flash",
+					provider: "google-ai-studio",
+					weight: 0.3,
+				},
+				{ model: "gpt-4o-mini", provider: "openai", weight: 0.15 },
+			],
+		},
+		{
 			source: "soulforge",
 			weight: 0.02,
 			models: [
@@ -1657,8 +1911,17 @@ async function seed() {
 		const streamedCount = Math.floor(baseRequests * randomFloat(0.6, 0.95));
 		const inputTokens = baseRequests * randomInt(900, 6000);
 		const outputTokens = baseRequests * randomInt(200, 2200);
-		const costPerReq = randomFloat(0.02, 0.18);
-		const totalCost = baseRequests * costPerReq;
+		// Vary the cache-hit share widely so the usage chart's token/cost
+		// breakdown shows hours where a big token total is cheap (mostly cached)
+		// next to hours where a smaller total is expensive (fresh input + output).
+		const hourCachedTokens = Math.floor(inputTokens * randomFloat(0.05, 0.85));
+		// Derive costs from the token mix at plausible per-token rates so the
+		// per-class costs and the total reconcile ($3/M fresh input, $0.30/M
+		// cached input, $15/M output).
+		const hourInputCost = (inputTokens - hourCachedTokens) * 3e-6;
+		const hourCachedInputCost = hourCachedTokens * 0.3e-6;
+		const hourOutputCost = outputTokens * 15e-6;
+		const totalCost = hourInputCost + hourCachedInputCost + hourOutputCost;
 		devpassHourlyStats.push({
 			id: `devpass-phs-${h}`,
 			projectId: "test-personal-project-id",
@@ -1681,16 +1944,16 @@ async function seed() {
 			outputTokens: String(outputTokens),
 			totalTokens: String(inputTokens + outputTokens),
 			reasoningTokens: "0",
-			cachedTokens: String(Math.floor(inputTokens * 0.15)),
+			cachedTokens: String(hourCachedTokens),
 			cost: Number(totalCost.toFixed(4)),
-			inputCost: Number((totalCost * 0.55).toFixed(4)),
-			outputCost: Number((totalCost * 0.4).toFixed(4)),
-			requestCost: Number((totalCost * 0.05).toFixed(4)),
+			inputCost: Number(hourInputCost.toFixed(4)),
+			outputCost: Number(hourOutputCost.toFixed(4)),
+			requestCost: 0,
 			dataStorageCost: 0,
 			discountSavings: 0,
 			imageInputCost: 0,
 			imageOutputCost: 0,
-			cachedInputCost: 0,
+			cachedInputCost: Number(hourCachedInputCost.toFixed(4)),
 			creditsRequestCount: baseRequests,
 			apiKeysRequestCount: 0,
 			creditsCost: Number(totalCost.toFixed(4)),
@@ -1755,6 +2018,7 @@ async function seed() {
 				imageInputCost: 0,
 				imageOutputCost: 0,
 				audioInputCost: 0,
+				audioOutputCost: 0,
 				videoOutputCost: 0,
 				cachedInputCost: 0,
 				cacheWriteInputCost: 0,
@@ -1820,6 +2084,7 @@ async function seed() {
 				imageInputCost: 0,
 				imageOutputCost: 0,
 				audioInputCost: 0,
+				audioOutputCost: 0,
 				videoOutputCost: 0,
 				cachedInputCost: 0,
 				cacheWriteInputCost: 0,
@@ -1845,9 +2110,9 @@ async function seed() {
 		name: "Test User's Workspace",
 		billingEmail: "admin@example.com",
 		credits: 0,
-		retentionLevel: "retain",
+		retentionLevel: "none",
 		plan: "free",
-		isPersonal: true,
+		kind: "devpass",
 		devPlan: "pro",
 		devPlanCycle: "monthly",
 		devPlanCreditsUsed: usedCredits.toFixed(4),
@@ -1858,6 +2123,7 @@ async function seed() {
 	await upsert(tables.user, {
 		id: "enterprise-user-id",
 		name: "Enterprise User",
+		// Login: enterprise@example.com / enterprise@example.com (password == email)
 		email: "enterprise@example.com",
 		emailVerified: true,
 	});
@@ -1866,7 +2132,7 @@ async function seed() {
 		id: "enterprise-account-id",
 		providerId: "credential",
 		accountId: "enterprise-account-id",
-		password: PASSWORD_HASH,
+		password: await hashPassword("enterprise@example.com"),
 		userId: "enterprise-user-id",
 	});
 
@@ -1877,6 +2143,8 @@ async function seed() {
 		credits: 1000,
 		retentionLevel: "retain",
 		plan: "enterprise",
+		planStartedAt: daysAgo(300),
+		planExpiresAt: daysFromNow(65),
 	});
 
 	await upsert(tables.userOrganization, {
@@ -1886,9 +2154,27 @@ async function seed() {
 		role: "owner",
 	});
 
+	// Also make the default admin (admin@example.com) an admin of the enterprise
+	// org so it can be reached by switching orgs with the same login.
+	await upsert(tables.userOrganization, {
+		id: "enterprise-admin-user-org-id",
+		userId: "test-user-id",
+		organizationId: "enterprise-org-id",
+		role: "admin",
+	});
+
 	await upsert(tables.project, {
 		id: "enterprise-project-id",
 		name: "Enterprise Project",
+		organizationId: "enterprise-org-id",
+		mode: "hybrid",
+	});
+
+	// A second project in the enterprise org, so the developer below has a
+	// project they are NOT granted access to (for testing project-scoped RBAC).
+	await upsert(tables.project, {
+		id: "enterprise-project-secondary-id",
+		name: "Restricted Project",
 		organizationId: "enterprise-org-id",
 		mode: "hybrid",
 	});
@@ -1899,6 +2185,55 @@ async function seed() {
 		projectId: "enterprise-project-id",
 		description: "Enterprise API Key",
 		createdBy: "enterprise-user-id",
+	});
+
+	// A project-scoped "developer" member of the enterprise org — limited to the
+	// Enterprise Project only — for testing the RBAC/developer experience. Log in
+	// as developer@example.com with the password developer@example.com (== email).
+	await upsert(tables.user, {
+		id: "enterprise-dev-user-id",
+		name: "Enterprise Developer",
+		email: "developer@example.com",
+		emailVerified: true,
+		onboardingCompleted: true,
+	});
+
+	await upsert(tables.account, {
+		id: "enterprise-dev-account-id",
+		providerId: "credential",
+		accountId: "enterprise-dev-account-id",
+		password: await hashPassword("developer@example.com"),
+		userId: "enterprise-dev-user-id",
+	});
+
+	await upsert(tables.userOrganization, {
+		id: "enterprise-dev-user-org-id",
+		userId: "enterprise-dev-user-id",
+		organizationId: "enterprise-org-id",
+		role: "developer",
+		// A sample budget so the developer sees the caps an admin set on them.
+		maxApiKeys: 3,
+		usageLimit: "50",
+		periodUsageLimit: "10",
+		periodUsageDurationValue: 1,
+		periodUsageDurationUnit: "day",
+	});
+
+	// Grant the developer access to the Enterprise Project only (not the
+	// restricted one above).
+	await upsert(tables.userProject, {
+		id: "enterprise-dev-user-project-id",
+		userOrganizationId: "enterprise-dev-user-org-id",
+		projectId: "enterprise-project-id",
+	});
+
+	// A key the developer created, so their own-usage view has something to show.
+	await upsert(tables.apiKey, {
+		id: "enterprise-dev-api-key-id",
+		token: "test-enterprise-dev",
+		projectId: "enterprise-project-id",
+		description: "Enterprise Developer API Key",
+		createdBy: "enterprise-dev-user-id",
 	});
 
 	await Promise.all(logs.map((log) => upsert(tables.log, log)));
@@ -1912,6 +2247,40 @@ async function seed() {
 		currency: "USD",
 		status: "completed",
 		description: "Test credit top-up for referral eligibility",
+	});
+
+	const devpassRenewalCreatedAt = daysAgo(6);
+	await upsert(tables.transaction, {
+		id: "test-devpass-renewal-transaction-id",
+		organizationId: "test-personal-org-id",
+		createdAt: devpassRenewalCreatedAt,
+		updatedAt: devpassRenewalCreatedAt,
+		type: "dev_plan_renewal",
+		amount: "79",
+		creditAmount: String(getDevPlanCreditsLimit("pro")),
+		currency: "USD",
+		status: "completed",
+		stripePaymentIntentId: "pi_seed_devpass_renewal",
+		stripeInvoiceId: "in_seed_devpass_renewal",
+		description: "Seeded DevPass Pro renewal for admin dashboard",
+	});
+
+	const devpassRefundCreatedAt = new Date();
+	await upsert(tables.transaction, {
+		id: "test-devpass-refund-transaction-id",
+		organizationId: "test-personal-org-id",
+		createdAt: devpassRefundCreatedAt,
+		updatedAt: devpassRefundCreatedAt,
+		type: "credit_refund",
+		amount: "15",
+		creditAmount: "0",
+		currency: "USD",
+		status: "completed",
+		stripePaymentIntentId: "pi_seed_devpass_renewal",
+		stripeRefundId: "re_seed_devpass_refund",
+		relatedTransactionId: "test-devpass-renewal-transaction-id",
+		refundReason: "requested_by_customer",
+		description: "Seeded DevPass refund for admin dashboard",
 	});
 
 	// ── Bulk seed data for admin dashboard ──
@@ -1929,7 +2298,8 @@ async function seed() {
 			id: `account-${u.id}`,
 			providerId: "credential",
 			accountId: `account-${u.id}`,
-			password: PASSWORD_HASH,
+			// Password == email, e.g. alice.chen@techcorp.io logs in with that string.
+			password: await hashPassword(u.email),
 			userId: u.id,
 		});
 	}
@@ -1942,14 +2312,27 @@ async function seed() {
 			billingEmail: org.billingEmail,
 			plan: org.plan,
 			credits: org.credits,
+			// DevPass and Chat orgs are always metadata-only; retention is not
+			// offered on those products.
 			retentionLevel:
-				org.plan === "enterprise"
-					? "retain"
-					: secureRandom() < 0.5
+				org.kind !== "default"
+					? "none"
+					: org.plan === "enterprise"
 						? "retain"
-						: "none",
+						: secureRandom() < 0.5
+							? "retain"
+							: "none",
 			status: org.status,
-			isPersonal: org.isPersonal,
+			kind: org.kind,
+			planStartedAt: org.planTermDays
+				? daysAgo(org.planTermDays.started)
+				: null,
+			planExpiresAt: org.planTermDays
+				? daysFromNow(org.planTermDays.endsIn)
+				: null,
+			isTrialActive: Boolean(org.trialDays),
+			trialStartDate: org.trialDays ? daysAgo(org.trialDays.started) : null,
+			trialEndDate: org.trialDays ? daysFromNow(org.trialDays.endsIn) : null,
 			devPlan: org.devPlan,
 			devPlanCreditsUsed:
 				org.devPlan !== "none" ? String(randomFloat(0, 20)) : "0",
@@ -1975,6 +2358,228 @@ async function seed() {
 			role: mapping.role,
 		});
 	}
+
+	// Yearly model-survey (census) responses so the public /data/<year>
+	// registry has content locally. Three models cross the 5-response
+	// anonymity threshold; gpt-4o-mini stays below it to exercise the
+	// hidden-model state.
+	const censusYear = new Date().getUTCFullYear();
+	const censusRespondents = [
+		{ userId: "user-alice", organizationId: "org-personal-alice" },
+		{ userId: "user-bob", organizationId: "org-personal-alice" },
+		{ userId: "user-carol", organizationId: "org-personal-dave" },
+		{ userId: "user-dave", organizationId: "org-personal-dave" },
+		{ userId: "user-elena", organizationId: "org-personal-maya" },
+		{ userId: "user-frank", organizationId: "org-personal-maya" },
+		{ userId: "user-grace", organizationId: "org-personal-alice" },
+	];
+	const censusModels: Array<{
+		modelId: string;
+		responses: Array<{
+			valueScore: number;
+			qualityScore: number;
+			speedScore: number;
+			wouldRecommend: boolean;
+			primaryUseCase: string;
+		}>;
+	}> = [
+		{
+			modelId: "claude-3.5-sonnet",
+			responses: [
+				{
+					valueScore: 5,
+					qualityScore: 5,
+					speedScore: 4,
+					wouldRecommend: true,
+					primaryUseCase: "agentic_coding",
+				},
+				{
+					valueScore: 4,
+					qualityScore: 5,
+					speedScore: 4,
+					wouldRecommend: true,
+					primaryUseCase: "agentic_coding",
+				},
+				{
+					valueScore: 5,
+					qualityScore: 4,
+					speedScore: 3,
+					wouldRecommend: true,
+					primaryUseCase: "code_review",
+				},
+				{
+					valueScore: 4,
+					qualityScore: 5,
+					speedScore: 4,
+					wouldRecommend: true,
+					primaryUseCase: "agentic_coding",
+				},
+				{
+					valueScore: 5,
+					qualityScore: 4,
+					speedScore: 4,
+					wouldRecommend: true,
+					primaryUseCase: "debugging",
+				},
+				{
+					valueScore: 4,
+					qualityScore: 5,
+					speedScore: 3,
+					wouldRecommend: true,
+					primaryUseCase: "agentic_coding",
+				},
+				{
+					valueScore: 5,
+					qualityScore: 5,
+					speedScore: 4,
+					wouldRecommend: true,
+					primaryUseCase: "writing_tests",
+				},
+			],
+		},
+		{
+			modelId: "gpt-4o",
+			responses: [
+				{
+					valueScore: 4,
+					qualityScore: 4,
+					speedScore: 4,
+					wouldRecommend: true,
+					primaryUseCase: "agentic_coding",
+				},
+				{
+					valueScore: 4,
+					qualityScore: 4,
+					speedScore: 5,
+					wouldRecommend: true,
+					primaryUseCase: "debugging",
+				},
+				{
+					valueScore: 3,
+					qualityScore: 4,
+					speedScore: 4,
+					wouldRecommend: false,
+					primaryUseCase: "code_completion",
+				},
+				{
+					valueScore: 4,
+					qualityScore: 5,
+					speedScore: 4,
+					wouldRecommend: true,
+					primaryUseCase: "agentic_coding",
+				},
+				{
+					valueScore: 4,
+					qualityScore: 4,
+					speedScore: 5,
+					wouldRecommend: true,
+					primaryUseCase: "docs_and_explanations",
+				},
+				{
+					valueScore: 3,
+					qualityScore: 4,
+					speedScore: 4,
+					wouldRecommend: true,
+					primaryUseCase: "code_review",
+				},
+			],
+		},
+		{
+			modelId: "claude-3-haiku",
+			responses: [
+				{
+					valueScore: 5,
+					qualityScore: 3,
+					speedScore: 5,
+					wouldRecommend: true,
+					primaryUseCase: "code_completion",
+				},
+				{
+					valueScore: 4,
+					qualityScore: 3,
+					speedScore: 5,
+					wouldRecommend: true,
+					primaryUseCase: "code_completion",
+				},
+				{
+					valueScore: 4,
+					qualityScore: 4,
+					speedScore: 5,
+					wouldRecommend: true,
+					primaryUseCase: "docs_and_explanations",
+				},
+				{
+					valueScore: 5,
+					qualityScore: 3,
+					speedScore: 5,
+					wouldRecommend: false,
+					primaryUseCase: "debugging",
+				},
+				{
+					valueScore: 4,
+					qualityScore: 3,
+					speedScore: 5,
+					wouldRecommend: true,
+					primaryUseCase: "code_completion",
+				},
+			],
+		},
+		{
+			modelId: "gpt-4o-mini",
+			responses: [
+				{
+					valueScore: 4,
+					qualityScore: 3,
+					speedScore: 5,
+					wouldRecommend: true,
+					primaryUseCase: "code_completion",
+				},
+				{
+					valueScore: 3,
+					qualityScore: 3,
+					speedScore: 5,
+					wouldRecommend: false,
+					primaryUseCase: "other",
+				},
+				{
+					valueScore: 4,
+					qualityScore: 3,
+					speedScore: 4,
+					wouldRecommend: true,
+					primaryUseCase: "docs_and_explanations",
+				},
+				{
+					valueScore: 4,
+					qualityScore: 2,
+					speedScore: 5,
+					wouldRecommend: true,
+					primaryUseCase: "code_completion",
+				},
+			],
+		},
+	];
+	const censusResponses: Array<Record<string, any>> = [];
+	for (const model of censusModels) {
+		model.responses.forEach((response, i) => {
+			const respondent = censusRespondents[i % censusRespondents.length];
+			const createdAt = daysAgo(randomInt(1, 20));
+			censusResponses.push({
+				id: `census-${model.modelId}-${i}`,
+				year: censusYear,
+				quarter: Math.floor(createdAt.getUTCMonth() / 3) + 1,
+				userId: respondent.userId,
+				organizationId: respondent.organizationId,
+				modelId: model.modelId,
+				...response,
+				comment: null,
+				requestCount: randomInt(60, 900),
+				devPlanTier: "pro",
+				rewardTier: null,
+				createdAt,
+			});
+		});
+	}
+	await bulkInsert(tables.modelSurveyResponse, censusResponses);
 
 	const projects = generateProjects();
 	for (const proj of projects) {
@@ -2070,6 +2675,7 @@ async function seed() {
 				imageInputCost: 0,
 				imageOutputCost: 0,
 				audioInputCost: 0,
+				audioOutputCost: 0,
 				videoOutputCost: 0,
 				cachedInputCost: 0,
 				cacheWriteInputCost: 0,
@@ -2102,6 +2708,16 @@ async function seed() {
 	const seedModelHistory = generateSeedModelHistory();
 	await bulkInsert(tables.modelHistory, seedModelHistory);
 
+	const seedMappingHistoryHourly =
+		generateSeedModelProviderMappingHistoryHourly(seedMappings);
+	await bulkInsert(
+		tables.modelProviderMappingHistoryHourly,
+		seedMappingHistoryHourly,
+	);
+
+	const seedModelHistoryHourly = generateSeedModelHistoryHourly();
+	await bulkInsert(tables.modelHistoryHourly, seedModelHistoryHourly);
+
 	await upsert(tables.enterpriseContactSubmission, {
 		id: "ecs_seed_1",
 		name: "Sarah Chen",
@@ -2117,7 +2733,7 @@ async function seed() {
 	});
 
 	await closeDatabase();
-	await redisClient.quit();
+	await Promise.all([redisClient.quit(), storageRedisClient.quit()]);
 }
 
 void seed();

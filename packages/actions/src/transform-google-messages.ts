@@ -7,7 +7,9 @@ import {
 	type ProviderId,
 } from "@llmgateway/models";
 
+import { parseDataUrl } from "./parse-data-url.js";
 import { processImageUrl } from "./process-image-url.js";
+import { RequestError } from "./request-error.js";
 
 type GoogleAudioFormat =
 	| "wav"
@@ -27,6 +29,7 @@ const VERTEX_FAMILY: ReadonlySet<string> = new Set(["google-vertex", "quartz"]);
 const AI_STUDIO_FAMILY: ReadonlySet<string> = new Set([
 	"google-ai-studio",
 	"glacier",
+	"iceberg",
 ]);
 
 const AI_STUDIO_AUDIO_MIME: Partial<Record<GoogleAudioFormat, string>> = {
@@ -80,9 +83,9 @@ export function googleProviderSupportsAudioFormat(
  * format/provider mismatch instead of a generic 500.
  */
 export class UnsupportedAudioFormatError extends Error {
-	readonly format: string;
-	readonly providerTarget: string;
-	constructor(format: string, providerTarget: string) {
+	public readonly format: string;
+	public readonly providerTarget: string;
+	public constructor(format: string, providerTarget: string) {
 		super(`Audio format "${format}" is not supported by ${providerTarget}.`);
 		this.name = "UnsupportedAudioFormatError";
 		this.format = format;
@@ -97,7 +100,7 @@ export class UnsupportedAudioFormatError extends Error {
  * actionable validation error instead of a generic 500.
  */
 export class InvalidFileContentError extends Error {
-	constructor(message: string) {
+	public constructor(message: string) {
 		super(message);
 		this.name = "InvalidFileContentError";
 	}
@@ -112,9 +115,9 @@ export class InvalidFileContentError extends Error {
  * typed error so the client sees a clean 400 with a consistent shape.
  */
 export class UnsupportedDocumentFormatError extends Error {
-	readonly mimeType: string;
-	readonly providerTarget: string;
-	constructor(mimeType: string, providerTarget: string) {
+	public readonly mimeType: string;
+	public readonly providerTarget: string;
+	public constructor(mimeType: string, providerTarget: string) {
 		super(
 			`Document MIME type "${mimeType}" is not supported by ${providerTarget}.`,
 		);
@@ -172,17 +175,18 @@ export function parseGoogleUpstreamDocumentError(
  * Returns null when the value isn't a base64 data URL. Optional RFC 2397
  * MIME parameters (e.g. `;charset=utf-8`) are accepted but stripped, since
  * Google's `inline_data.mime_type` expects a bare type/subtype.
+ *
+ * Delegates to `parseDataUrl` so the (potentially multi-megabyte) base64 body
+ * is never scanned or copied by a regex — only the short header is parsed.
  */
 function parseFileDataUrl(
 	fileData: string,
 ): { mimeType: string; data: string } | null {
-	const match = fileData.match(
-		/^data:([^;,]+)((?:;[^;,]+=[^;,]*)*);base64,(.*)$/i,
-	);
-	if (!match) {
+	const parsed = parseDataUrl(fileData);
+	if (!parsed || !parsed.isBase64 || !parsed.mediaType) {
 		return null;
 	}
-	return { mimeType: match[1], data: match[3] };
+	return { mimeType: parsed.mediaType, data: parsed.data };
 }
 
 function resolveGoogleProviderTarget(
@@ -376,6 +380,15 @@ export async function transformGoogleMessages(
 						// Don't expose the URL in the error message for security
 						const errorMsg =
 							error instanceof Error ? error.message : "Unknown error";
+						// Preserve the RequestError type (and its status code) so the
+						// gateway returns a 4xx and logs a client_error row instead of
+						// treating a client-caused image failure as an unhandled 500.
+						if (error instanceof RequestError) {
+							throw new RequestError(
+								`Failed to process image: ${errorMsg}`,
+								error.statusCode,
+							);
+						}
 						throw new Error(`Failed to process image: ${errorMsg}`);
 					}
 				} else if (isInputAudioContent(content)) {

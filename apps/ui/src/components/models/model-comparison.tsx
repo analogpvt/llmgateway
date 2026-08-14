@@ -24,6 +24,7 @@ import {
 } from "@/lib/components/table";
 import { useAppConfig } from "@/lib/config";
 import Logo from "@/lib/icons/Logo";
+import { getLoungeStudioPath } from "@/lib/model-utils";
 import { formatContextSize } from "@/lib/utils";
 
 import {
@@ -84,6 +85,7 @@ type PriceField =
 	| "imageInputPrice";
 
 type ProviderWithInfo = ProviderModelMapping & {
+	discount?: string | null;
 	providerInfo?: (typeof providerDefinitions)[number];
 };
 
@@ -734,13 +736,18 @@ export function ModelComparison() {
 		[rightModelId],
 	);
 
-	const buildPlaygroundUrl = (providerId?: string, modelId?: string) => {
+	const buildPlaygroundUrl = (
+		providerId?: string,
+		modelId?: string,
+		output?: readonly string[] | null,
+	) => {
 		if (!modelId) {
 			return config.playgroundUrl;
 		}
 		const modelParam = providerId ? `${providerId}/${modelId}` : modelId;
+		const studioPath = getLoungeStudioPath(output);
 
-		return `${config.playgroundUrl}/?model=${encodeURIComponent(modelParam)}`;
+		return `${config.playgroundUrl}${studioPath || "/"}?model=${encodeURIComponent(modelParam)}`;
 	};
 
 	return (
@@ -895,11 +902,12 @@ export function ModelComparison() {
 												queryLeftProviderId ??
 													leftModel.providers[0]?.providerId,
 												leftModel.id,
+												leftModel.model.output,
 											)}
 											target="_blank"
 											rel="noopener noreferrer"
 										>
-											Try in Chat
+											Try in Lounge
 										</a>
 									</Button>
 								</>
@@ -919,11 +927,12 @@ export function ModelComparison() {
 												queryRightProviderId ??
 													rightModel.providers[0]?.providerId,
 												rightModel.id,
+												rightModel.model.output,
 											)}
 											target="_blank"
 											rel="noopener noreferrer"
 										>
-											Try in Chat
+											Try in Lounge
 										</a>
 									</Button>
 								</>

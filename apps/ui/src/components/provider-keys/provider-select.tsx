@@ -1,14 +1,7 @@
 "use client";
 
-import {
-	Select,
-	SelectContent,
-	SelectItem,
-	SelectTrigger,
-	SelectValue,
-} from "@/lib/components/select";
-
 import { providerLogoUrls } from "@llmgateway/shared/components";
+import { SearchableSelect } from "@llmgateway/shared/components";
 
 import type { ProviderId } from "@llmgateway/models";
 
@@ -33,37 +26,27 @@ export function ProviderSelect({
 	providers,
 	loading = false,
 	placeholder = "Select provider...",
-	emptyMessage = "No providers available",
+	emptyMessage = "No providers found.",
 	disabled = false,
 }: ProviderSelectProps) {
 	return (
-		<Select onValueChange={onValueChange} value={value} disabled={disabled}>
-			<SelectTrigger className="w-full">
-				<SelectValue placeholder={placeholder} />
-			</SelectTrigger>
-			<SelectContent>
-				{loading ? (
-					<SelectItem value="loading" disabled>
-						Loading providers...
-					</SelectItem>
-				) : providers.length > 0 ? (
-					providers.map((provider) => {
-						const LogoComponent = providerLogoUrls[provider.id as ProviderId];
-						return (
-							<SelectItem key={provider.id} value={provider.id}>
-								<div className="flex items-center gap-2">
-									{LogoComponent && <LogoComponent className="h-4 w-4" />}
-									<span>{provider.name}</span>
-								</div>
-							</SelectItem>
-						);
-					})
-				) : (
-					<SelectItem value="none" disabled>
-						{emptyMessage}
-					</SelectItem>
-				)}
-			</SelectContent>
-		</Select>
+		<SearchableSelect
+			value={value}
+			onValueChange={(next) => onValueChange?.(next)}
+			disabled={disabled || loading}
+			placeholder={loading ? "Loading providers..." : placeholder}
+			searchPlaceholder="Search providers..."
+			emptyMessage={emptyMessage}
+			aria-label="Provider"
+			options={providers.map((provider) => {
+				const Logo = providerLogoUrls[provider.id as ProviderId];
+				return {
+					value: provider.id,
+					label: provider.name,
+					keywords: provider.id,
+					icon: Logo ? <Logo className="h-4 w-4 shrink-0" /> : null,
+				};
+			})}
+		/>
 	);
 }

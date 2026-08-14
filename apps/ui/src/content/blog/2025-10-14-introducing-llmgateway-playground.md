@@ -2,8 +2,8 @@
 id: blog-introducing-llmgateway-playground
 slug: introducing-llmgateway-playground
 date: 2025-10-14
-title: Introducing LLM Gateway Chat — Test 180+ Models in One Interface
-summary: Compare GPT-5, Claude, Gemini, and 180+ other models side by side. Generate images, test prompts, and find the best model for your use case.
+title: Introducing LLM Gateway Chat — Test 280+ Models in One Interface
+summary: Compare GPT-5, Claude, Gemini, and 280+ other models side by side. Generate images, test prompts, and find the best model for your use case.
 categories: ["Announcements"]
 image:
   src: "/blog/introducing-chat-llmgateway.png"
@@ -14,7 +14,7 @@ image:
 
 Choosing the right LLM used to mean signing up for multiple accounts, managing different API keys, and switching between interfaces. Not anymore.
 
-[**LLM Gateway Chat**](https://chat.llmgateway.io) lets you test any model in our catalog—GPT-5, Claude, Gemini, Llama, and 180+ others—from one interface. Compare outputs, test prompts, and find the best model for your use case before writing a single line of code.
+[**LLM Gateway Chat**](https://lounge.llmgateway.io) lets you test any model in our catalog—GPT-5, Claude, Gemini, Llama, and 180+ others—from one interface. Compare outputs, test prompts, and find the best model for your use case before writing a single line of code.
 
 ## Built for Speed
 
@@ -61,7 +61,7 @@ Drag and drop images or documents into any conversation. Vision models analyze t
 
 ## Try It Now
 
-1. Go to [chat.llmgateway.io](https://chat.llmgateway.io)
+1. Go to [lounge.llmgateway.io](https://lounge.llmgateway.io)
 2. Sign in with your LLM Gateway account
 3. Pick a model and start chatting
 
@@ -80,6 +80,6 @@ Every request in the playground appears in your analytics dashboard—same track
 
 ---
 
-**[Try the Playground →](https://chat.llmgateway.io)**
+**[Try the Playground →](https://lounge.llmgateway.io)**
 
 Questions or feedback? Find us on [GitHub](https://github.com/theopenco/llmgateway) or [Discord](https://llmgateway.io/discord).

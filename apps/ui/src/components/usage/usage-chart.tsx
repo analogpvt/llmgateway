@@ -12,8 +12,11 @@ import {
 } from "recharts";
 
 import { getDateRangeFromParams } from "@/components/date-range-picker";
+import { useUsageMode } from "@/components/shared/usage-mode-selector";
 import { useDashboardState } from "@/lib/dashboard-state";
 import { useApi } from "@/lib/fetch-client";
+import { getBrowserTimeZone } from "@/lib/timezone";
+import { pickRequests } from "@/lib/usage-mode";
 
 import type { ActivitT } from "@/types/activity";
 import type { TooltipProps } from "recharts";
@@ -54,6 +57,7 @@ export function UsageChart({
 }: UsageChartProps) {
 	const searchParams = useSearchParams();
 	const { selectedProject } = useDashboardState();
+	const usageMode = useUsageMode();
 
 	const { from, to } = getDateRangeFromParams(searchParams);
 	const fromStr = format(from, "yyyy-MM-dd");
@@ -68,6 +72,7 @@ export function UsageChart({
 				query: {
 					from: fromStr,
 					to: toStr,
+					timezone: getBrowserTimeZone(),
 					...(projectId ? { projectId: projectId } : {}),
 					...(apiKeyId ? { apiKeyId } : {}),
 				},
@@ -136,7 +141,7 @@ export function UsageChart({
 			return {
 				date,
 				formattedDate: format(parseISO(date), "MMM d"),
-				requests: dayData.requestCount,
+				requests: pickRequests(dayData, usageMode),
 			};
 		}
 		return {

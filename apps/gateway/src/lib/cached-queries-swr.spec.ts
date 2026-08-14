@@ -1,15 +1,21 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { redisClient, SWR_PREFIX } from "@llmgateway/cache";
+import {
+	redisClient,
+	SWR_PREFIX,
+	waitForSwrMirrorWrites,
+} from "@llmgateway/cache";
 import {
 	cdb,
 	db,
 	eq,
 	apiKey,
 	apiKeyIamRule,
+	discount,
 	organization,
 	project,
 	providerKey,
+	providerKeyAllowsModel,
 	user,
 	userOrganization,
 } from "@llmgateway/db";
@@ -19,6 +25,8 @@ import {
 	findActiveIamRules,
 	findActiveProviderKeys,
 	findApiKeyByToken,
+	findEffectiveDiscount,
+	findManagedProviderAvailability,
 	findOrganizationById,
 	findProjectById,
 	findProviderKey,
@@ -35,6 +43,8 @@ const testApiKeyToken = "sk-test-swr-token";
 const testProviderKeyOpenAi = "test-provider-key-swr-openai";
 const testProviderKeyAnthropic = "test-provider-key-swr-anthropic";
 const testIamRuleId = "test-iam-rule-swr";
+const testDiscountId = "test-discount-swr";
+const ONE_YEAR_MS = 365 * 24 * 60 * 60 * 1000;
 
 async function flushDrizzleCache(): Promise<void> {
 	const keys = await redisClient.keys("drizzle:cache:*");
@@ -57,11 +67,13 @@ async function flushSwrOnly(): Promise<void> {
 describe("cached-queries SWR integration", () => {
 	beforeEach(async () => {
 		vi.restoreAllMocks();
+		await waitForSwrMirrorWrites();
 
 		// Clean relevant tables
 		await db.delete(apiKeyIamRule);
 		await db.delete(apiKey);
 		await db.delete(providerKey);
+		await db.delete(discount).where(eq(discount.id, testDiscountId));
 		await db.delete(userOrganization);
 		await db.delete(project);
 		await db.delete(organization).where(eq(organization.id, testOrgId));
@@ -139,13 +151,27 @@ describe("cached-queries SWR integration", () => {
 			ruleValue: { models: ["gpt-4"] },
 			status: "active",
 		});
+
+		await db.insert(discount).values({
+			id: testDiscountId,
+			organizationId: testOrgId,
+			provider: "openai",
+			model: "gpt-4",
+			discountPercent: "0.25",
+			reason: "SWR test discount",
+			// Non-null future expiry so the JS expiry filter has a value to evaluate
+			// (exercises the active-discount path, including on a Drizzle cache hit).
+			expiresAt: new Date(Date.now() + ONE_YEAR_MS),
+		});
 	});
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
+		await waitForSwrMirrorWrites();
 		await db.delete(apiKeyIamRule);
 		await db.delete(apiKey);
 		await db.delete(providerKey);
+		await db.delete(discount).where(eq(discount.id, testDiscountId));
 		await db.delete(userOrganization);
 		await db.delete(project);
 		await db.delete(organization).where(eq(organization.id, testOrgId));
@@ -157,6 +183,7 @@ describe("cached-queries SWR integration", () => {
 		it("findApiKeyByToken primes mirror at hashed-token key", async () => {
 			const result = await findApiKeyByToken(testApiKeyToken);
 			expect(result?.id).toBe(testApiKeyId);
+			await waitForSwrMirrorWrites();
 
 			const mirror = await redisClient.get(
 				`${SWR_PREFIX}apiKey:token:${getApiKeyFingerprint(testApiKeyToken)}`,
@@ -171,6 +198,7 @@ describe("cached-queries SWR integration", () => {
 		it("findProjectById primes mirror at project:{id}", async () => {
 			const result = await findProjectById(testProjectId);
 			expect(result?.id).toBe(testProjectId);
+			await waitForSwrMirrorWrites();
 
 			const mirror = await redisClient.get(
 				`${SWR_PREFIX}project:${testProjectId}`,
@@ -181,6 +209,7 @@ describe("cached-queries SWR integration", () => {
 		it("findOrganizationById primes mirror at org:{id}", async () => {
 			const result = await findOrganizationById(testOrgId);
 			expect(result?.id).toBe(testOrgId);
+			await waitForSwrMirrorWrites();
 
 			const mirror = await redisClient.get(`${SWR_PREFIX}org:${testOrgId}`);
 			expect(mirror).not.toBeNull();
@@ -189,6 +218,7 @@ describe("cached-queries SWR integration", () => {
 		it("findActiveIamRules primes mirror at iamRules:{apiKeyId}", async () => {
 			const result = await findActiveIamRules(testApiKeyId);
 			expect(result).toHaveLength(1);
+			await waitForSwrMirrorWrites();
 
 			const mirror = await redisClient.get(
 				`${SWR_PREFIX}iamRules:${testApiKeyId}`,
@@ -199,6 +229,7 @@ describe("cached-queries SWR integration", () => {
 		it("findProviderKey primes mirror at providerKey:{org}:{provider}", async () => {
 			const result = await findProviderKey(testOrgId, "openai");
 			expect(result).toBeDefined();
+			await waitForSwrMirrorWrites();
 
 			const mirror = await redisClient.get(
 				`${SWR_PREFIX}providerKey:${testOrgId}:openai`,
@@ -209,6 +240,7 @@ describe("cached-queries SWR integration", () => {
 		it("findActiveProviderKeys primes mirror at providerKey:active:{org}", async () => {
 			const result = await findActiveProviderKeys(testOrgId);
 			expect(result.length).toBeGreaterThan(0);
+			await waitForSwrMirrorWrites();
 
 			const mirror = await redisClient.get(
 				`${SWR_PREFIX}providerKey:active:${testOrgId}`,
@@ -222,6 +254,7 @@ describe("cached-queries SWR integration", () => {
 				"anthropic",
 			]);
 			expect(result).toHaveLength(2);
+			await waitForSwrMirrorWrites();
 
 			const mirror = await redisClient.get(
 				`${SWR_PREFIX}providerKey:byProviders:${testOrgId}:anthropic,openai`,
@@ -232,17 +265,47 @@ describe("cached-queries SWR integration", () => {
 		it("findUserFromOrganization primes mirror at userFromOrg:{org}", async () => {
 			const result = await findUserFromOrganization(testOrgId);
 			expect(result?.user.id).toBe(testUserId);
+			await waitForSwrMirrorWrites();
 
 			const mirror = await redisClient.get(
 				`${SWR_PREFIX}userFromOrg:${testOrgId}`,
 			);
 			expect(mirror).not.toBeNull();
 		});
+
+		it("findEffectiveDiscount primes mirror at discount:{org}:{provider}:{model}", async () => {
+			const result = await findEffectiveDiscount(testOrgId, "openai", "gpt-4");
+			expect(result.discount).toBe("0.25");
+			expect(result.source).toBe("org_provider_model");
+			await waitForSwrMirrorWrites();
+
+			const mirror = await redisClient.get(
+				`${SWR_PREFIX}discount:${testOrgId}:openai:gpt-4`,
+			);
+			expect(mirror).not.toBeNull();
+		});
+
+		it("findEffectiveDiscount resolves an expiring discount on a Drizzle cache hit", async () => {
+			// First call populates the Drizzle cache.
+			const first = await findEffectiveDiscount(testOrgId, "openai", "gpt-4");
+			expect(first.discount).toBe("0.25");
+			await waitForSwrMirrorWrites();
+
+			// Drop the SWR mirror so the next call can't fall back to it — it must
+			// resolve through the Drizzle cache and apply the JS expiry filter to the
+			// cached row (whose expiresAt is non-null) without erroring.
+			await flushSwrOnly();
+
+			const second = await findEffectiveDiscount(testOrgId, "openai", "gpt-4");
+			expect(second.discount).toBe("0.25");
+			expect(second.source).toBe("org_provider_model");
+		});
 	});
 
 	describe("fallback when DB fails", () => {
 		it("returns SWR mirror when Drizzle cache is flushed and DB errors", async () => {
 			await findApiKeyByToken(testApiKeyToken);
+			await waitForSwrMirrorWrites();
 
 			// Expire Drizzle cache keys only, keeping SWR mirror.
 			await flushDrizzleCache();
@@ -257,8 +320,113 @@ describe("cached-queries SWR integration", () => {
 			selectSpy.mockRestore();
 		});
 
+		it("model-restricted managed scopes survive a DB outage via SWR", async () => {
+			await db.insert(providerKey).values({
+				id: "swr-managed-restricted",
+				token: "swr-managed-restricted-token",
+				provider: "openai",
+				managed: true,
+				organizationId: null,
+				status: "active",
+				allowedModels: ["special-model"],
+			});
+
+			// Prime once — the per-model narrowing happens in memory after the
+			// cached row fetch, so every model shares the same mirror entry.
+			expect(
+				(await findManagedProviderAvailability(undefined, "special-model"))
+					.usable,
+			).toContain("openai");
+			await waitForSwrMirrorWrites();
+			await flushDrizzleCache();
+
+			const selectSpy = vi.spyOn(cdb, "select").mockImplementation(() => {
+				throw new Error("postgres unavailable");
+			});
+
+			// The mirrored rows carry allowedModels (a text[] round-tripped through
+			// JSON), so the restriction keeps filtering during the outage instead
+			// of failing open or erroring.
+			expect(
+				(await findManagedProviderAvailability(undefined, "special-model"))
+					.usable,
+			).toContain("openai");
+			expect(
+				(await findManagedProviderAvailability(undefined, "some-other-model"))
+					.usable,
+			).not.toContain("openai");
+
+			selectSpy.mockRestore();
+		});
+
+		it("model-restricted BYOK selection survives a DB outage via SWR", async () => {
+			// Restrict the primary key and add an unrestricted sibling, mirroring
+			// an org whose first account only has one model enabled upstream.
+			await db
+				.update(providerKey)
+				.set({ allowedModels: ["special-model"] })
+				.where(eq(providerKey.id, testProviderKeyOpenAi));
+			await db.insert(providerKey).values({
+				id: "swr-openai-unrestricted",
+				token: "swr-openai-unrestricted-token",
+				provider: "openai",
+				organizationId: testOrgId,
+				status: "active",
+			});
+			const filterFor =
+				(modelId: string) =>
+				(key: { allowedModels: string[] | null }): boolean =>
+					providerKeyAllowsModel(key.allowedModels, modelId);
+
+			expect(
+				(
+					await findProviderKey(
+						testOrgId,
+						"openai",
+						"special-model",
+						undefined,
+						filterFor("special-model"),
+					)
+				)?.id,
+			).toBe(testProviderKeyOpenAi);
+			await waitForSwrMirrorWrites();
+			await flushDrizzleCache();
+
+			const selectSpy = vi.spyOn(cdb, "select").mockImplementation(() => {
+				throw new Error("postgres unavailable");
+			});
+
+			// The filter runs on the mirrored rows, so selection keeps honoring
+			// the restriction — restricted key for its model, sibling otherwise.
+			expect(
+				(
+					await findProviderKey(
+						testOrgId,
+						"openai",
+						"special-model",
+						undefined,
+						filterFor("special-model"),
+					)
+				)?.id,
+			).toBe(testProviderKeyOpenAi);
+			expect(
+				(
+					await findProviderKey(
+						testOrgId,
+						"openai",
+						"some-other-model",
+						undefined,
+						filterFor("some-other-model"),
+					)
+				)?.id,
+			).toBe("swr-openai-unrestricted");
+
+			selectSpy.mockRestore();
+		});
+
 		it("throws when SWR mirror is gone and DB errors", async () => {
 			await findApiKeyByToken(testApiKeyToken);
+			await waitForSwrMirrorWrites();
 			await flushDrizzleCache();
 			await flushSwrOnly();
 
@@ -276,6 +444,7 @@ describe("cached-queries SWR integration", () => {
 		it("zero-credit org still resolves via SWR when DB is down", async () => {
 			const primed = await findOrganizationById(testZeroOrgId);
 			expect(primed?.id).toBe(testZeroOrgId);
+			await waitForSwrMirrorWrites();
 
 			await flushDrizzleCache();
 
@@ -294,11 +463,28 @@ describe("cached-queries SWR integration", () => {
 			selectSpy.mockRestore();
 			selectUncachedSpy.mockRestore();
 		});
+
+		it("returns effective discount SWR mirror when DB errors", async () => {
+			await findEffectiveDiscount(testOrgId, "openai", "gpt-4");
+			await waitForSwrMirrorWrites();
+			await flushDrizzleCache();
+
+			const selectSpy = vi.spyOn(cdb, "select").mockImplementation(() => {
+				throw new Error("postgres unavailable");
+			});
+
+			const result = await findEffectiveDiscount(testOrgId, "openai", "gpt-4");
+			expect(result.discount).toBe("0.25");
+			expect(result.source).toBe("org_provider_model");
+
+			selectSpy.mockRestore();
+		});
 	});
 
 	describe("mutation invalidates SWR mirror", () => {
 		it("updating a row via cdb clears SWR mirrors for that table", async () => {
 			await findProjectById(testProjectId);
+			await waitForSwrMirrorWrites();
 			expect(
 				await redisClient.get(`${SWR_PREFIX}project:${testProjectId}`),
 			).not.toBeNull();

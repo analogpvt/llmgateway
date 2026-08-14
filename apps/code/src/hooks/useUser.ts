@@ -7,9 +7,15 @@ import { useEffect } from "react";
 import { useAppConfig } from "@/lib/config";
 import { useApi } from "@/lib/fetch-client";
 
+import type { paths } from "@/lib/api/v1";
+
+export type UserMe =
+	paths["/user/me"]["get"]["responses"]["200"]["content"]["application/json"];
+
 export interface UseUserOptions {
 	redirectTo?: string;
 	redirectWhen?: "authenticated" | "unauthenticated";
+	initialData?: UserMe | null;
 }
 
 export function useUser(options?: UseUserOptions) {
@@ -28,6 +34,7 @@ export function useUser(options?: UseUserOptions) {
 			retry: 0,
 			staleTime: 5 * 60 * 1000,
 			refetchOnWindowFocus: false,
+			initialData: options?.initialData ?? undefined,
 		},
 	);
 
@@ -78,4 +85,29 @@ export function useUpdateUser() {
 			void queryClient.invalidateQueries({ queryKey: ["session"] });
 		},
 	});
+}
+
+export function useDeleteAccount() {
+	const api = useApi();
+	return api.useMutation("delete", "/user/me");
+}
+
+/**
+ * What deleting the account will tear down: the organizations the user is the
+ * last member of, and the Stripe subscriptions those organizations still hold.
+ * Fetched so the confirmation dialog can name them instead of cancelling the
+ * DevPass subscription silently.
+ */
+export function useAccountDeletionPreview(enabled = true) {
+	const api = useApi();
+	return api.useQuery(
+		"get",
+		"/user/me/deletion-preview",
+		{},
+		{
+			enabled,
+			staleTime: 60 * 1000,
+			refetchOnWindowFocus: false,
+		},
+	);
 }

@@ -1,16 +1,31 @@
 import { Decimal } from "decimal.js";
 
-import { type ProviderMetrics, metricsKey } from "@llmgateway/db";
+import {
+	getEffectiveDiscount,
+	type ProviderMetrics,
+	metricsKey,
+} from "@llmgateway/db";
 import {
 	getProviderDefinition,
 	type AvailableModelProvider,
 	type ModelWithPricing,
 	type ProviderModelMapping,
 } from "@llmgateway/models";
+import { randomFloat, randomInt } from "@llmgateway/shared/random";
 import {
 	getDefaultRoutingConfig,
 	type ResolvedRoutingConfig,
 } from "@llmgateway/shared/routing-config";
+
+import {
+	computeWeightedProviderScores,
+	getEffectiveScoringWeights,
+} from "./compute-provider-scores.js";
+
+import type {
+	RoutingCredentialSource,
+	RoutingExclusionReason,
+} from "@llmgateway/shared/routing-telemetry";
 
 interface ProviderScore<T extends AvailableModelProvider> {
 	provider: T;
@@ -20,14 +35,7 @@ interface ProviderScore<T extends AvailableModelProvider> {
 	latency?: number;
 	throughput?: number;
 	cacheSupported?: boolean;
-}
-
-function calculateUptimePenalty(uptime: number, threshold: number): number {
-	if (uptime >= threshold) {
-		return 0;
-	}
-	const deficit = (threshold - uptime) / threshold;
-	return Math.pow(deficit * 5, 2);
+	discount?: Decimal;
 }
 
 function getExplorationRate(cfg: ResolvedRoutingConfig): number {
@@ -76,6 +84,20 @@ export interface RoutingMetadata {
 	selectedProvider: string;
 	selectionReason: string;
 	usedApiKeyHash?: string;
+	// Whose credential the served attempt was sent with: the organization's own
+	// provider key (`byok`) or an LLM Gateway platform credential (`platform`).
+	// Without it, `usedApiKeyHash` is an opaque fingerprint that gives no hint
+	// whether the request was billed to the provider or to credits.
+	usedCredentialSource?: RoutingCredentialSource;
+	// The organization's own key that served the request, named as its owner
+	// sees it. Only set when usedCredentialSource is "byok" — a platform
+	// credential is never described to a tenant.
+	usedProviderKeyId?: string;
+	usedProviderKeyLabel?: string;
+	// The organization's own keys that were candidates for the used provider,
+	// in selection order, so an operator can see which of their keys the
+	// gateway had to choose from. BYOK rows only; never platform credentials.
+	eligibleProviderKeys?: Array<{ id: string; label?: string }>;
 	providerScores: Array<{
 		providerId: string;
 		region?: string;
@@ -86,6 +108,7 @@ export interface RoutingMetadata {
 		price: number;
 		priority?: number;
 		cacheSupported?: boolean;
+		discount?: number;
 		// Populated after retry loop if this provider was attempted and failed
 		failed?: boolean;
 		status_code?: number;
@@ -96,6 +119,9 @@ export interface RoutingMetadata {
 		contentFilterProvider?: boolean;
 		// Set when the provider was excluded because the gateway content filter matched
 		excludedByContentFilter?: boolean;
+		// Set when hybrid keyed-provider preference demoted this credits-backed
+		// candidate; kept in the scores as a last-resort retry target
+		hybrid_demoted?: boolean;
 	}>;
 	// Optional fields for low-uptime fallback routing
 	originalProvider?: string;
@@ -121,13 +147,55 @@ export interface RoutingMetadata {
 		error_type: string;
 		succeeded: boolean;
 		apiKeyHash?: string;
+		// Per attempt, because a single request can switch credential owners
+		// mid-flight: in hybrid mode a failing BYOK key falls back to the
+		// platform credential, and both attempts land in this array.
+		credentialSource?: RoutingCredentialSource;
+		providerKeyId?: string;
+		providerKeyLabel?: string;
 		logId?: string;
 	}>;
+	// Provider mappings that were filtered out because they don't support requested params/features
+	filteredProviders?: Array<{
+		providerId: string;
+		reasons: string[];
+		// Stable RoutingExclusionReason codes for the same exclusions; aggregated
+		// per hour into routing_exclusion_hourly.
+		codes?: RoutingExclusionReason[];
+	}>;
+	// Where the requested service tier came from: the request body, or a dev-plan
+	// (DevPass) org's configured default tier. Only set when a premium tier was in
+	// play — a defaulted tier narrows routing without appearing in the request.
+	serviceTierSource?: "request" | "coding-plan-default";
+	// Parameters that were stripped from the request because the selected provider doesn't support them
+	strippedParameters?: string[];
+	// Set when the request was resolved through a named dynamic route
+	dynamicRoute?: {
+		name: string;
+		version: number;
+		// Node ids traversed during graph evaluation
+		path: string[];
+	};
 }
 
 export interface ProviderSelectionResult<T extends AvailableModelProvider> {
 	provider: T;
 	metadata: RoutingMetadata;
+}
+
+export interface SessionProviderEntry {
+	providerId: string;
+	region?: string;
+}
+
+/**
+ * Persistence backend for sticky-session routing. The gateway implements this
+ * with a Redis-backed per-session entry; selection logic stays pure by reading
+ * and writing through these callbacks.
+ */
+export interface SessionProviderStore {
+	get: () => Promise<SessionProviderEntry | null>;
+	set: (providerId: string, region?: string) => Promise<void>;
 }
 
 export interface ProviderSelectionOptions {
@@ -141,53 +209,21 @@ export interface ProviderSelectionOptions {
 	 */
 	promptTokens?: number;
 	/**
-	 * Sticky-routing session identifier. When provided, the provider (and
-	 * region) is chosen deterministically via rendezvous hashing so that all
-	 * requests for the same session pin to the same provider, maximizing
-	 * upstream prompt-cache hits. Price/uptime scoring is bypassed; the session
-	 * only moves to another provider when its pinned provider is no longer in
-	 * the available list (e.g. excluded by health filtering or removed by the
-	 * retry-fallback loop after the provider failed).
+	 * Sticky-routing session store. When provided (and session stickiness is
+	 * enabled), the provider is selected with the normal weighted-score
+	 * algorithm and then persisted for the session: subsequent requests reuse
+	 * the saved provider so the upstream prompt cache stays warm. The pin only
+	 * breaks when the saved provider leaves the available list or its uptime
+	 * drops below the session uptime threshold, at which point the session is
+	 * re-scored and re-pinned to the new best provider.
 	 */
-	sessionId?: string;
+	sessionProviderStore?: SessionProviderStore;
 	routingConfig?: ResolvedRoutingConfig;
-}
-
-/**
- * FNV-1a 32-bit hash mapped to the unit interval [0, 1). Deterministic across
- * processes, no crypto needed.
- */
-function hashToUnitInterval(input: string): number {
-	let hash = 0x811c9dc5;
-	for (let i = 0; i < input.length; i++) {
-		hash ^= input.charCodeAt(i);
-		hash = Math.imul(hash, 0x01000193);
-	}
-	return (hash >>> 0) / 0xffffffff;
-}
-
-/**
- * Rendezvous (highest-random-weight) hashing: deterministically pick one
- * provider for a session. Unlike modulo hashing, removing a provider only
- * reassigns the sessions that were pinned to it — every other session keeps
- * its provider.
- */
-function selectStickyProvider<T extends AvailableModelProvider>(
-	providers: T[],
-	sessionId: string,
-): T {
-	let best = providers[0];
-	let bestWeight = -1;
-	for (const provider of providers) {
-		const weight = hashToUnitInterval(
-			`${sessionId}|${provider.providerId}|${provider.region ?? ""}`,
-		);
-		if (weight > bestWeight) {
-			bestWeight = weight;
-			best = provider;
-		}
-	}
-	return best;
+	organizationId?: string | null;
+	providerDiscountResolver?: (
+		provider: AvailableModelProvider,
+		modelId: string,
+	) => Promise<string | null | undefined> | string | null | undefined;
 }
 
 function findProviderMapping<P extends ModelWithPricing["providers"][number]>(
@@ -202,7 +238,7 @@ function findProviderMapping<P extends ModelWithPricing["providers"][number]>(
 	);
 }
 
-function providerSupportsCaching(
+export function providerSupportsCaching(
 	providerInfo:
 		| {
 				cachedInputPrice?: string;
@@ -241,7 +277,7 @@ function providerSupportsCaching(
 export interface VideoPricingContext {
 	durationSeconds: number;
 	includeAudio: boolean;
-	resolution: "default" | "hd" | "1080p" | "4k";
+	resolution: "default" | "hd" | "1080p" | "4k" | "768p" | "720p" | "480p";
 }
 
 function getPerSecondBillingKeys(
@@ -265,6 +301,31 @@ function getPerSecondBillingKeys(
 			: ["1080p_video", "hd_video", "default_video", "1080p", "hd", "default"];
 	}
 
+	if (videoPricing.resolution === "768p") {
+		return videoPricing.includeAudio
+			? ["768p_audio", "default_audio", "768p", "default"]
+			: ["768p_video", "default_video", "768p", "default"];
+	}
+
+	if (videoPricing.resolution === "720p") {
+		return videoPricing.includeAudio
+			? ["720p_audio", "768p_audio", "default_audio", "720p", "768p", "default"]
+			: [
+					"720p_video",
+					"768p_video",
+					"default_video",
+					"720p",
+					"768p",
+					"default",
+				];
+	}
+
+	if (videoPricing.resolution === "480p") {
+		return videoPricing.includeAudio
+			? ["480p_audio", "default_audio", "480p", "default"]
+			: ["480p_video", "default_video", "480p", "default"];
+	}
+
 	return videoPricing.includeAudio
 		? ["default_audio", "default"]
 		: ["default_video", "default"];
@@ -274,17 +335,15 @@ export function getProviderSelectionPrice(
 	providerInfo:
 		| Pick<
 				ProviderModelMapping,
-				| "discount"
 				| "inputPrice"
 				| "outputPrice"
 				| "perSecondPrice"
+				| "perImagePrice"
 				| "requestPrice"
 		  >
 		| undefined,
 	videoPricing?: VideoPricingContext,
 ): Decimal {
-	const discount = providerInfo?.discount ?? "0";
-	const discountMultiplier = new Decimal(1).minus(discount);
 	const inputPrice = providerInfo?.inputPrice;
 	const outputPrice = providerInfo?.outputPrice;
 	const requestPrice = providerInfo?.requestPrice;
@@ -298,32 +357,187 @@ export function getProviderSelectionPrice(
 		for (const billingKey of getPerSecondBillingKeys(videoPricing)) {
 			const perSecondPrice = providerInfo.perSecondPrice[billingKey];
 			if (perSecondPrice !== undefined) {
-				return new Decimal(perSecondPrice)
-					.times(videoPricing.durationSeconds)
-					.times(discountMultiplier);
+				return new Decimal(perSecondPrice).times(videoPricing.durationSeconds);
 			}
 		}
 	}
 
 	if (hasPositiveTokenPrice) {
-		return new Decimal(inputPrice ?? "0")
-			.plus(outputPrice ?? "0")
-			.div(2)
-			.times(discountMultiplier);
+		return new Decimal(inputPrice ?? "0").plus(outputPrice ?? "0").div(2);
+	}
+
+	if (providerInfo?.perImagePrice) {
+		// Represent the mapping by its cheapest obtainable tier, matching how
+		// every other branch (and the gateway's pricingScore) ranks mappings.
+		const values = Object.values(providerInfo.perImagePrice).filter(
+			(v) => v !== undefined,
+		);
+		if (values.length > 0) {
+			return values.reduce(
+				(min, v) => (new Decimal(v).lt(min) ? new Decimal(v) : min),
+				new Decimal(values[0]),
+			);
+		}
 	}
 
 	if (requestPrice !== undefined && !hasPositiveTokenPrice) {
-		return new Decimal(requestPrice).times(discountMultiplier);
+		return new Decimal(requestPrice);
 	}
 
 	if (hasAnyTokenPrice) {
-		return new Decimal(inputPrice ?? "0")
-			.plus(outputPrice ?? "0")
-			.div(2)
-			.times(discountMultiplier);
+		return new Decimal(inputPrice ?? "0").plus(outputPrice ?? "0").div(2);
 	}
 
 	return new Decimal(0);
+}
+
+type ProviderSelectionPriceInfo = AvailableModelProvider &
+	Pick<
+		ProviderModelMapping,
+		| "inputPrice"
+		| "outputPrice"
+		| "perSecondPrice"
+		| "perImagePrice"
+		| "requestPrice"
+	>;
+
+export async function getDiscountedProviderSelectionPrice(
+	providerInfo: ProviderSelectionPriceInfo | undefined,
+	modelId: string,
+	options?: Pick<
+		ProviderSelectionOptions,
+		"organizationId" | "providerDiscountResolver"
+	> & {
+		videoPricing?: VideoPricingContext;
+	},
+): Promise<{ price: Decimal; discount: Decimal }> {
+	const basePrice = getProviderSelectionPrice(
+		providerInfo,
+		options?.videoPricing,
+	);
+	const discount = providerInfo
+		? await getProviderSelectionDiscount(providerInfo, modelId, options)
+		: new Decimal(0);
+
+	return {
+		price: basePrice.times(new Decimal(1).minus(discount)),
+		discount,
+	};
+}
+
+function providerSelectionKey(provider: AvailableModelProvider): string {
+	return `${provider.providerId}:${provider.region ?? ""}`;
+}
+
+async function getProviderSelectionDiscount(
+	provider: AvailableModelProvider,
+	modelId: string,
+	options?: ProviderSelectionOptions,
+): Promise<Decimal> {
+	const discount =
+		options?.providerDiscountResolver !== undefined
+			? await options.providerDiscountResolver(provider, modelId)
+			: options?.organizationId !== undefined
+				? (
+						await getEffectiveDiscount(
+							options.organizationId,
+							provider.providerId,
+							modelId,
+						)
+					).discount
+				: "0";
+	const parsedDiscount = new Decimal(discount ?? "0");
+
+	if (parsedDiscount.lte(0) || parsedDiscount.gt(1)) {
+		return new Decimal(0);
+	}
+
+	return parsedDiscount;
+}
+
+async function getProviderSelectionPrices<T extends AvailableModelProvider>(
+	providers: T[],
+	modelWithPricing: ModelWithPricing & { id: string },
+	videoPricing: VideoPricingContext | undefined,
+	options?: ProviderSelectionOptions,
+): Promise<Map<string, { price: Decimal; discount: Decimal }>> {
+	const providerPrices = await Promise.all(
+		providers.map(async (provider) => {
+			const providerInfo = findProviderMapping(
+				modelWithPricing.providers,
+				provider,
+			);
+			const { price, discount } = await getDiscountedProviderSelectionPrice(
+				providerInfo,
+				modelWithPricing.id,
+				{
+					...options,
+					videoPricing,
+				},
+			);
+
+			return [providerSelectionKey(provider), { price, discount }] as const;
+		}),
+	);
+
+	return new Map(providerPrices);
+}
+
+/**
+ * Apply sticky-session routing on top of a freshly computed selection.
+ *
+ * If the session already has a pinned provider that is still available and
+ * healthy (uptime at or above the session threshold), reuse it so the upstream
+ * prompt cache stays warm. Otherwise persist the just-scored best provider so
+ * subsequent requests in this session reuse it. The pin only moves when its
+ * provider leaves the candidate list or its uptime drops too low.
+ */
+async function applySessionSticky<T extends AvailableModelProvider>(
+	naturalResult: ProviderSelectionResult<T>,
+	candidates: T[],
+	store: SessionProviderStore,
+	cfg: ResolvedRoutingConfig,
+	modelId: string,
+	metricsMap: Map<string, ProviderMetrics> | undefined,
+): Promise<ProviderSelectionResult<T>> {
+	const saved = await store.get();
+	if (saved) {
+		const candidate = candidates.find(
+			(c) =>
+				c.providerId === saved.providerId &&
+				(saved.region === undefined || c.region === saved.region),
+		);
+		if (candidate) {
+			const uptime = metricsMap?.get(
+				metricsKey(modelId, candidate.providerId, candidate.region),
+			)?.uptime;
+			if (uptime === undefined || uptime >= cfg.session.uptimeThreshold) {
+				// Re-persist so the pin's TTL keeps refreshing while the session
+				// stays active.
+				await store.set(candidate.providerId, candidate.region);
+				return {
+					provider: candidate,
+					metadata: {
+						...naturalResult.metadata,
+						selectedProvider: candidate.providerId,
+						selectionReason: "session-sticky",
+					},
+				};
+			}
+		}
+	}
+
+	await store.set(
+		naturalResult.provider.providerId,
+		naturalResult.provider.region,
+	);
+	return {
+		provider: naturalResult.provider,
+		metadata: {
+			...naturalResult.metadata,
+			selectionReason: "session-sticky",
+		},
+	};
 }
 
 /**
@@ -335,26 +549,28 @@ export function getProviderSelectionPrice(
  * @param options - Optional settings including metricsMap and isStreaming flag
  * @returns Best provider and routing metadata, or null if none available
  */
-export function getCheapestFromAvailableProviders<
+export async function getCheapestFromAvailableProviders<
 	T extends AvailableModelProvider,
 >(
 	availableModelProviders: T[],
 	modelWithPricing: ModelWithPricing & { id: string; output?: string[] },
 	options?: ProviderSelectionOptions,
-): ProviderSelectionResult<T> | null {
+): Promise<ProviderSelectionResult<T> | null> {
 	const metricsMap = options?.metricsMap;
 	const isStreaming = options?.isStreaming ?? false;
 	const videoPricing = options?.videoPricing;
 	const promptTokens = options?.promptTokens;
 	const cfg = options?.routingConfig ?? getDefaultRoutingConfig();
-	const { weights, thresholds } = cfg;
+	const { thresholds } = cfg;
 	// Use higher price weight for image generation models
 	const isImageModel = modelWithPricing.output?.includes("image") ?? false;
-	const effectivePriceWeight = isImageModel
-		? weights.imagePrice
-		: weights.price;
 	const cacheSupportRelevant =
 		promptTokens !== undefined && promptTokens >= thresholds.cachePromptTokens;
+	const scoringFlags = {
+		isStreaming,
+		isImageModel,
+		cacheRelevant: cacheSupportRelevant,
+	};
 	if (availableModelProviders.length === 0) {
 		return null;
 	}
@@ -385,62 +601,31 @@ export function getCheapestFromAvailableProviders<
 		return null;
 	}
 
-	// Sticky routing: when a session id is provided (and session stickiness is
-	// enabled for the project), pin the session to a single provider via
-	// rendezvous hashing. Bypasses scoring and exploration so the upstream
-	// prompt cache stays warm; the session only moves if its provider leaves
-	// the available list (health filtering or retry-fallback exclusion).
-	const sessionId = options?.sessionId?.trim();
-	if (sessionId && cfg.session.enabled) {
-		const stickyProvider = selectStickyProvider(stableProviders, sessionId);
-		return {
-			provider: stickyProvider,
-			metadata: {
-				availableProviders: stableProviders.map((p) => p.providerId),
-				selectedProvider: stickyProvider.providerId,
-				selectionReason: "session-sticky",
-				providerScores: stableProviders.map((provider) => {
-					const providerInfo = findProviderMapping(
-						modelWithPricing.providers,
-						provider,
-					);
-					const providerDef = getProviderDefinition(provider.providerId);
-					const priority = providerDef?.priority ?? 1;
-					const metrics = metricsMap?.get(
-						metricsKey(
-							modelWithPricing.id,
-							provider.providerId,
-							provider.region,
-						),
-					);
+	const providerSelectionPrices = await getProviderSelectionPrices(
+		stableProviders,
+		modelWithPricing,
+		videoPricing,
+		options,
+	);
 
-					return {
-						providerId: provider.providerId,
-						region: provider.region,
-						score: 0,
-						uptime: metrics?.uptime,
-						latency: metrics?.averageLatency,
-						throughput: metrics?.throughput,
-						price: getProviderSelectionPrice(
-							providerInfo,
-							videoPricing,
-						).toNumber(),
-						priority,
-						cacheSupported: providerSupportsCaching(
-							providerInfo as ProviderModelMapping | undefined,
-						),
-					};
-				}),
-			},
-		};
-	}
+	// Sticky routing: when a session store is provided (and session stickiness
+	// is enabled for the project), the provider is scored with the normal
+	// weighted algorithm below and then pinned for the session via the store.
+	// Exploration is skipped so the deterministic best is what gets persisted.
+	const sessionStore = options?.sessionProviderStore;
+	const sessionSticky = sessionStore !== undefined && cfg.session.enabled;
 
 	// Epsilon-greedy exploration: randomly select a provider some % of the time
 	// (configurable per project via thresholds.explorationRate). Skip during tests
-	// to keep behavior deterministic.
-	if (!isTestProcess() && Math.random() < getExplorationRate(cfg)) {
+	// to keep behavior deterministic, and for sticky sessions where we want the
+	// scored best provider to be the one we pin.
+	if (
+		!sessionSticky &&
+		!isTestProcess() &&
+		randomFloat() < getExplorationRate(cfg)
+	) {
 		const randomProvider =
-			stableProviders[Math.floor(Math.random() * stableProviders.length)];
+			stableProviders[randomInt(0, stableProviders.length)];
 		return {
 			provider: randomProvider,
 			metadata: {
@@ -468,14 +653,17 @@ export function getCheapestFromAvailableProviders<
 						uptime: metrics?.uptime,
 						latency: metrics?.averageLatency,
 						throughput: metrics?.throughput,
-						price: getProviderSelectionPrice(
-							providerInfo,
-							videoPricing,
+						price: (
+							providerSelectionPrices.get(providerSelectionKey(provider))
+								?.price ?? getProviderSelectionPrice(providerInfo, videoPricing)
 						).toNumber(),
 						priority,
 						cacheSupported: providerSupportsCaching(
 							providerInfo as ProviderModelMapping | undefined,
 						),
+						discount: providerSelectionPrices
+							.get(providerSelectionKey(provider))
+							?.discount.toNumber(),
 					};
 				}),
 			},
@@ -484,32 +672,47 @@ export function getCheapestFromAvailableProviders<
 
 	// If no metrics provided, fall back to price-only selection
 	if (!metricsMap || metricsMap.size === 0) {
-		return selectByPriceOnly(
+		const priceOnlyResult = selectByPriceOnly(
 			stableProviders,
 			modelWithPricing,
 			videoPricing,
 			cfg,
+			providerSelectionPrices,
 		);
+		return sessionSticky
+			? await applySessionSticky(
+					priceOnlyResult,
+					stableProviders,
+					sessionStore,
+					cfg,
+					modelWithPricing.id,
+					metricsMap,
+				)
+			: priceOnlyResult;
 	}
 
 	// If the project zeroed out every scoring weight, the weighted-score path
 	// would divide by zero. Fall back to price-only selection (still honoring
 	// per-provider priority overrides and the priority-0 disable).
-	const effectiveLatencyWeight = isStreaming ? weights.latency : 0;
-	const effectiveCacheWeight = cacheSupportRelevant ? weights.cache : 0;
-	const totalWeight =
-		effectivePriceWeight +
-		weights.uptime +
-		weights.throughput +
-		effectiveLatencyWeight +
-		effectiveCacheWeight;
+	const totalWeight = getEffectiveScoringWeights(cfg, scoringFlags).total;
 	if (totalWeight <= 0) {
-		return selectByPriceOnly(
+		const priceOnlyResult = selectByPriceOnly(
 			stableProviders,
 			modelWithPricing,
 			videoPricing,
 			cfg,
+			providerSelectionPrices,
 		);
+		return sessionSticky
+			? await applySessionSticky(
+					priceOnlyResult,
+					stableProviders,
+					sessionStore,
+					cfg,
+					modelWithPricing.id,
+					metricsMap,
+				)
+			: priceOnlyResult;
 	}
 
 	// Calculate scores for each provider
@@ -520,7 +723,12 @@ export function getCheapestFromAvailableProviders<
 			modelWithPricing.providers,
 			provider,
 		);
-		const price = getProviderSelectionPrice(providerInfo, videoPricing);
+		const resolvedPrice = providerSelectionPrices.get(
+			providerSelectionKey(provider),
+		);
+		const price =
+			resolvedPrice?.price ??
+			getProviderSelectionPrice(providerInfo, videoPricing);
 
 		const mKey = metricsKey(
 			modelWithPricing.id,
@@ -533,6 +741,7 @@ export function getCheapestFromAvailableProviders<
 			provider,
 			score: new Decimal(0), // Will be calculated below
 			price,
+			discount: resolvedPrice?.discount,
 			uptime: metrics?.uptime,
 			latency: metrics?.averageLatency,
 			throughput: metrics?.throughput,
@@ -542,103 +751,24 @@ export function getCheapestFromAvailableProviders<
 		});
 	}
 
-	// Find best values for ratio-based scoring
-	// Instead of min-max normalization (which loses magnitude of differences),
-	// we use ratios against the best value so actual proportional differences
-	// are preserved. e.g., a provider 50% cheaper scores much better than one 5% cheaper.
-	const minPrice = providerScores.reduce(
-		(min, p) => (p.price.lt(min) ? p.price : min),
-		providerScores[0].price,
+	// Score all candidates with the shared weighted-score core (ratio-based
+	// sub-scores, priority penalty, exponential uptime penalty — lower wins).
+	// totalWeight is guaranteed > 0 above (zero-total falls back to price-only
+	// selection earlier in this function).
+	const breakdowns = computeWeightedProviderScores(
+		providerScores.map((p) => ({
+			price: p.price,
+			uptime: p.uptime,
+			latency: p.latency,
+			throughput: p.throughput,
+			cacheSupported: p.cacheSupported ?? false,
+			priority: getEffectivePriority(p.provider.providerId, cfg),
+		})),
+		cfg,
+		scoringFlags,
 	);
-
-	const uptimes = providerScores.map(
-		(p) => p.uptime ?? thresholds.defaultUptime,
-	);
-	const maxUptime = Math.max(...uptimes);
-
-	const throughputs = providerScores.map(
-		(p) => p.throughput ?? thresholds.defaultThroughput,
-	);
-	const maxThroughput = Math.max(...throughputs);
-
-	const latencies = providerScores.map(
-		(p) => p.latency ?? thresholds.defaultLatency,
-	);
-	const minLatency = Math.min(...latencies);
-
-	// Calculate ratio-based scores
-	for (const providerScore of providerScores) {
-		// Price ratio: 0 = cheapest, 0.5 = 50% more expensive, 1.0 = 2x more expensive
-		// This preserves the actual magnitude of price differences
-		const priceScore = minPrice.gt(0)
-			? providerScore.price.div(minPrice).minus(1)
-			: new Decimal(0);
-
-		// Uptime ratio: 0 = best uptime, proportional penalty for worse uptime
-		const uptime = providerScore.uptime ?? thresholds.defaultUptime;
-		const uptimeScore =
-			uptime > 0 ? new Decimal(maxUptime).div(uptime).minus(1) : new Decimal(1);
-
-		// Calculate exponential penalty for truly unstable providers
-		const uptimePenalty = new Decimal(
-			calculateUptimePenalty(uptime, thresholds.uptimePenalty),
-		);
-
-		// Throughput ratio: 0 = fastest, 0.5 = 50% slower, 1.0 = 2x slower
-		// This preserves the actual magnitude of throughput differences
-		const throughput = providerScore.throughput ?? thresholds.defaultThroughput;
-		const throughputScore =
-			throughput > 0
-				? new Decimal(maxThroughput).div(throughput).minus(1)
-				: new Decimal(1);
-
-		// Latency ratio: 0 = fastest, proportional penalty for slower
-		// Only consider latency for streaming requests since it's only measured there
-		let latencyScore = new Decimal(0);
-		if (isStreaming) {
-			const latency = providerScore.latency ?? thresholds.defaultLatency;
-			latencyScore =
-				minLatency > 0
-					? new Decimal(latency).div(minLatency).minus(1)
-					: new Decimal(0);
-		}
-
-		// Cache score: 0 when this provider supports prompt caching, 1 otherwise.
-		// Only weighted in when the prompt is large enough for caching to matter.
-		const cacheScore = providerScore.cacheSupported
-			? new Decimal(0)
-			: new Decimal(1);
-
-		// Calculate base weighted score (lower is better)
-		// When not streaming, latency weight is redistributed to other factors
-		// Image generation models use a higher price weight, and cache weight is
-		// dropped for short prompts where caching has no measurable effect.
-		// totalWeight is guaranteed > 0 above (zero-total falls back to
-		// price-only selection earlier in this function).
-		const weightSum = new Decimal(totalWeight);
-		const baseScore = new Decimal(effectivePriceWeight)
-			.div(weightSum)
-			.times(priceScore)
-			.plus(new Decimal(weights.uptime).div(weightSum).times(uptimeScore))
-			.plus(
-				new Decimal(weights.throughput).div(weightSum).times(throughputScore),
-			)
-			.plus(
-				new Decimal(effectiveLatencyWeight).div(weightSum).times(latencyScore),
-			)
-			.plus(new Decimal(effectiveCacheWeight).div(weightSum).times(cacheScore));
-
-		// Apply provider priority: lower priority = higher score (less preferred)
-		// Priority defaults to 1. We add (1 - priority) as a penalty.
-		const priority = getEffectivePriority(
-			providerScore.provider.providerId,
-			cfg,
-		);
-		const priorityPenalty = new Decimal(1).minus(priority);
-
-		// Final score = base weighted score + priority penalty + exponential uptime penalty
-		// The uptime penalty heavily penalizes providers with <95% uptime
-		providerScore.score = baseScore.plus(priorityPenalty).plus(uptimePenalty);
+	for (const [index, providerScore] of providerScores.entries()) {
+		providerScore.score = breakdowns[index].score;
 	}
 
 	// Select provider with lowest score
@@ -666,14 +796,26 @@ export function getCheapestFromAvailableProviders<
 				price: p.price.toNumber(), // Keep full precision for very small prices
 				priority,
 				cacheSupported: p.cacheSupported,
+				discount: p.discount?.toNumber(),
 			};
 		}),
 	};
 
-	return {
+	const weightedResult = {
 		provider: bestProvider.provider,
 		metadata,
 	};
+
+	return sessionSticky
+		? await applySessionSticky(
+				weightedResult,
+				stableProviders,
+				sessionStore,
+				cfg,
+				modelWithPricing.id,
+				metricsMap,
+			)
+		: weightedResult;
 }
 
 /**
@@ -684,6 +826,7 @@ function selectByPriceOnly<T extends AvailableModelProvider>(
 	modelWithPricing: ModelWithPricing & { id: string; output?: string[] },
 	videoPricing: VideoPricingContext | undefined,
 	cfg: ResolvedRoutingConfig,
+	providerSelectionPrices: Map<string, { price: Decimal; discount: Decimal }>,
 ): ProviderSelectionResult<T> {
 	let cheapestProvider = stableProviders[0];
 	let lowestEffectivePrice: Decimal | null = null;
@@ -694,6 +837,7 @@ function selectByPriceOnly<T extends AvailableModelProvider>(
 		price: Decimal;
 		effectivePrice: Decimal;
 		priority: number;
+		discount?: Decimal;
 	}> = [];
 
 	for (const provider of stableProviders) {
@@ -701,7 +845,12 @@ function selectByPriceOnly<T extends AvailableModelProvider>(
 			modelWithPricing.providers,
 			provider,
 		);
-		const totalPrice = getProviderSelectionPrice(providerInfo, videoPricing);
+		const resolvedPrice = providerSelectionPrices.get(
+			providerSelectionKey(provider),
+		);
+		const totalPrice =
+			resolvedPrice?.price ??
+			getProviderSelectionPrice(providerInfo, videoPricing);
 
 		// Apply provider priority: lower priority = effectively higher price
 		const priority = getEffectivePriority(provider.providerId, cfg);
@@ -713,6 +862,7 @@ function selectByPriceOnly<T extends AvailableModelProvider>(
 			price: totalPrice,
 			effectivePrice,
 			priority,
+			discount: resolvedPrice?.discount,
 		});
 
 		if (
@@ -734,6 +884,7 @@ function selectByPriceOnly<T extends AvailableModelProvider>(
 			score: 0,
 			price: p.price.toNumber(),
 			priority: p.priority,
+			discount: p.discount?.toNumber(),
 		})),
 	};
 

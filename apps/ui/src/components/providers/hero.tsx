@@ -13,12 +13,16 @@ import { AuthLink } from "@/components/shared/auth-link";
 import { Button } from "@/lib/components/button";
 import { getConfig } from "@/lib/config-server";
 import Logo from "@/lib/icons/Logo";
+import { cn } from "@/lib/utils";
 
 import {
 	providers as providerDefinitions,
 	type ProviderId,
 } from "@llmgateway/models";
-import { providerLogoUrls } from "@llmgateway/shared/components";
+import {
+	providerLogoUrls,
+	RunwareWordmarkIcon,
+} from "@llmgateway/shared/components";
 
 interface HeroProps {
 	providerId: ProviderId;
@@ -63,8 +67,31 @@ function DataPolicyBadge({
 export function Hero({ providerId }: HeroProps) {
 	const config = getConfig();
 	const provider = providerDefinitions.find((p) => p.id === providerId)!;
+	const referenceLinks = [
+		provider.statusPageUrl
+			? { label: "Status Page", href: provider.statusPageUrl }
+			: null,
+		provider.termsUrl
+			? { label: "Terms of Service", href: provider.termsUrl }
+			: null,
+		provider.privacyPolicyUrl
+			? { label: "Privacy Policy", href: provider.privacyPolicyUrl }
+			: null,
+	].filter((link): link is { label: string; href: string } => link !== null);
 
 	const getProviderIcon = (providerId: ProviderId) => {
+		// Runware's brand asset is a wide wordmark, so give it the full slot
+		// width instead of the square icon treatment.
+		if (providerId === "runware") {
+			return (
+				<RunwareWordmarkIcon
+					className="h-auto w-full"
+					aria-label="Runware"
+					role="img"
+				/>
+			);
+		}
+
 		const LogoComponent = providerLogoUrls[providerId];
 		if (LogoComponent) {
 			return <LogoComponent className="h-24 w-24 object-contain" />;
@@ -103,7 +130,7 @@ export function Hero({ providerId }: HeroProps) {
 								rel="noopener noreferrer"
 							>
 								<Play className="h-4 w-4" />
-								Try in Playground
+								Try in Lounge
 							</a>
 						</Button>
 						<Button variant="ghost" asChild>
@@ -199,8 +226,10 @@ export function Hero({ providerId }: HeroProps) {
 												<ShieldCheck className="h-3.5 w-3.5 text-muted-foreground" />
 												<span className="text-muted-foreground">SOC2:</span>
 												<DataPolicyBadge
-													value={provider.dataPolicy.soc2}
-													labelTrue="Certified"
+													value={Boolean(provider.dataPolicy.soc2)}
+													labelTrue={`Type ${
+														provider.dataPolicy.soc2 === 1 ? "I" : "II"
+													} Certified`}
 													labelFalse="No"
 												/>
 											</div>
@@ -221,36 +250,44 @@ export function Hero({ providerId }: HeroProps) {
 									</>
 								)}
 							</div>
+							{provider.additionalLinks &&
+								provider.additionalLinks.length > 0 && (
+									<div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 border-t pt-3 text-sm text-muted-foreground">
+										{provider.additionalLinks.map((additionalLink) => (
+											<a
+												key={additionalLink.link}
+												href={additionalLink.link}
+												target="_blank"
+												rel="noopener noreferrer"
+												className="inline-flex items-center gap-1 transition-colors hover:text-foreground"
+											>
+												{additionalLink.desc}
+												<ExternalLink className="h-3 w-3" />
+											</a>
+										))}
+									</div>
+								)}
 						</div>
 					)}
 
-					{(provider.termsUrl || provider.privacyPolicyUrl) && (
+					{referenceLinks.length > 0 && (
 						<div className="mt-4 flex items-center gap-x-4 text-sm text-muted-foreground">
-							{provider.termsUrl && (
-								<a
-									href={provider.termsUrl}
-									target="_blank"
-									rel="noopener noreferrer"
-									className="inline-flex items-center gap-1 hover:text-foreground transition-colors"
-								>
-									Terms of Service
-									<ExternalLink className="h-3 w-3" />
-								</a>
-							)}
-							{provider.termsUrl && provider.privacyPolicyUrl && (
-								<span className="text-muted-foreground/50">|</span>
-							)}
-							{provider.privacyPolicyUrl && (
-								<a
-									href={provider.privacyPolicyUrl}
-									target="_blank"
-									rel="noopener noreferrer"
-									className="inline-flex items-center gap-1 hover:text-foreground transition-colors"
-								>
-									Privacy Policy
-									<ExternalLink className="h-3 w-3" />
-								</a>
-							)}
+							{referenceLinks.map((link, index) => (
+								<div key={link.href} className="flex items-center gap-x-4">
+									{index > 0 && (
+										<span className="text-muted-foreground/50">|</span>
+									)}
+									<a
+										href={link.href}
+										target="_blank"
+										rel="noopener noreferrer"
+										className="inline-flex items-center gap-1 hover:text-foreground transition-colors"
+									>
+										{link.label}
+										<ExternalLink className="h-3 w-3" />
+									</a>
+								</div>
+							))}
 						</div>
 					)}
 				</div>
@@ -261,7 +298,14 @@ export function Hero({ providerId }: HeroProps) {
 					<div className="flex items-center h-32">
 						<div className="w-0.5 h-52 bg-muted-foreground opacity-50 rounded rotate-[30deg]" />
 					</div>
-					<div className="h-24 w-24 relative top-10">
+					<div
+						className={cn(
+							"relative top-10",
+							providerId === "runware"
+								? "flex h-24 w-56 items-center sm:w-64"
+								: "h-24 w-24",
+						)}
+					>
 						{getProviderIcon(providerId)}
 					</div>
 				</div>

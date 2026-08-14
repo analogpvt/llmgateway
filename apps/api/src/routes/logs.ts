@@ -2,10 +2,17 @@ import { createRoute, OpenAPIHono } from "@hono/zod-openapi";
 import { HTTPException } from "hono/http-exception";
 import { z } from "zod";
 
-import { getActiveUserOrganizationIds } from "@/utils/authorization.js";
+import { apiKeyScopeFilter } from "@/lib/api-key-scope-filter.js";
+import {
+	getActiveUserOrganizationIds,
+	getApiKeyScope,
+	getUserProjectIds,
+	userHasProjectAccess,
+} from "@/utils/authorization.js";
 
 import {
 	and,
+	API_ORIGINS,
 	asc,
 	db,
 	desc,
@@ -32,10 +39,20 @@ import type { ServerTypes } from "@/vars.js";
 
 export const logs = new OpenAPIHono<ServerTypes>();
 
-type LogRecord = InferSelectModel<typeof tables.log>;
+// internalErrorDetails is omitted: public log queries never select it.
+type LogRecord = Omit<
+	InferSelectModel<typeof tables.log>,
+	"internalErrorDetails"
+>;
+
+// internalErrorDetails holds the raw upstream error for stealth providers and
+// must never leave the internal admin surface, so strip it from the columns
+// served by the public logs endpoints.
+const { internalErrorDetails: _internalErrorDetails, ...publicLogColumns } =
+	getTableColumns(tables.log);
 
 const logSelection = {
-	...getTableColumns(tables.log),
+	...publicLogColumns,
 	organizationName: tables.organization.name,
 	projectName: tables.project.name,
 	apiKeyName: tables.apiKey.description,
@@ -99,6 +116,7 @@ const logSchema = z.object({
 	projectName: z.string().nullable().optional(),
 	apiKeyId: z.string(),
 	apiKeyName: z.string().nullable().optional(),
+	providerKeyId: z.string().nullable().optional(),
 	duration: z.number(),
 	requestedModel: z.string(),
 	requestedProvider: z.string().nullable(),
@@ -113,7 +131,10 @@ const logSchema = z.object({
 	completionTokens: z.string().nullable(),
 	totalTokens: z.string().nullable(),
 	reasoningTokens: z.string().nullable(),
+	cachedTokens: z.string().nullable().optional(),
 	cacheWriteTokens: z.string().nullable().optional(),
+	cacheWrite5mTokens: z.string().nullable().optional(),
+	cacheWrite1hTokens: z.string().nullable().optional(),
 	messages: z.any(),
 	temperature: z.number().nullable(),
 	maxTokens: z.number().nullable(),
@@ -138,9 +159,11 @@ const logSchema = z.object({
 	contentFilterCost: z.number().nullable().optional(),
 	imageInputTokens: z.string().nullable(),
 	audioInputTokens: z.string().nullable(),
+	audioOutputTokens: z.string().nullable(),
 	imageOutputTokens: z.string().nullable(),
 	imageInputCost: z.number().nullable(),
 	audioInputCost: z.number().nullable(),
+	audioOutputCost: z.number().nullable(),
 	imageOutputCost: z.number().nullable(),
 	videoOutputCost: z.number().nullable(),
 	videoDownloadCount: z.number().nullable(),
@@ -152,6 +175,7 @@ const logSchema = z.object({
 	customHeaders: z.any().nullable(),
 	mode: z.enum(["api-keys", "credits", "hybrid"]),
 	usedMode: z.enum(["api-keys", "credits"]),
+	apiOrigin: z.enum(API_ORIGINS).nullable(),
 	source: z.string().nullable(),
 	sessionId: z.string().nullable().optional(),
 	routingMetadata: z
@@ -160,6 +184,17 @@ const logSchema = z.object({
 			selectedProvider: z.string().optional(),
 			selectionReason: z.string().optional(),
 			usedApiKeyHash: z.string().optional(),
+			usedCredentialSource: z.enum(["byok", "platform"]).optional(),
+			usedProviderKeyId: z.string().optional(),
+			usedProviderKeyLabel: z.string().optional(),
+			eligibleProviderKeys: z
+				.array(
+					z.object({
+						id: z.string(),
+						label: z.string().optional(),
+					}),
+				)
+				.optional(),
 			providerScores: z
 				.array(
 					z.object({
@@ -194,14 +229,29 @@ const logSchema = z.object({
 						error_type: z.string(),
 						succeeded: z.boolean(),
 						apiKeyHash: z.string().optional(),
+						credentialSource: z.enum(["byok", "platform"]).optional(),
+						providerKeyId: z.string().optional(),
+						providerKeyLabel: z.string().optional(),
 						logId: z.string().optional(),
 					}),
 				)
 				.optional(),
+			filteredProviders: z
+				.array(
+					z.object({
+						providerId: z.string(),
+						reasons: z.array(z.string()),
+					}),
+				)
+				.optional(),
+			strippedParameters: z.array(z.string()).optional(),
+			serviceTierSource: z.enum(["request", "coding-plan-default"]).optional(),
 		})
 		.nullable()
 		.optional(),
 	discount: z.number().nullable().optional(),
+	requestedServiceTier: z.string().nullable().optional(),
+	usedServiceTier: z.string().nullable().optional(),
 	retried: z.boolean().nullable().optional(),
 	retriedByLogId: z.string().nullable().optional(),
 	gatewayContentFilterResponse: gatewayContentFilterResponseSchema
@@ -299,6 +349,11 @@ const querySchema = z.object({
 		description: "Filter logs by session ID",
 		example: "conversation-9f8e7d6c",
 	}),
+	usedMode: z.enum(["all", "credits", "api-keys"]).optional().openapi({
+		description:
+			"Filter logs by billing mode: credits (billed against the organization balance) or api-keys (BYOK provider keys, not billed)",
+		example: "credits",
+	}),
 });
 
 const get = createRoute({
@@ -376,6 +431,7 @@ logs.openapi(get, async (c) => {
 		customHeaderValue,
 		requestId,
 		sessionId,
+		usedMode,
 	} = {
 		...query,
 		apiKeyId: sanitize(query.apiKeyId),
@@ -393,6 +449,7 @@ logs.openapi(get, async (c) => {
 		customHeaderValue: sanitize(query.customHeaderValue),
 		requestId: sanitize(query.requestId),
 		sessionId: sanitize(query.sessionId),
+		usedMode: sanitize(query.usedMode) as "credits" | "api-keys" | undefined,
 	};
 
 	// Set default limit if not provided or enforce max limit
@@ -451,14 +508,23 @@ logs.openapi(get, async (c) => {
 		});
 	}
 
-	const projectIds = projects.map((project) => project.id);
+	// Intersect with RBAC-aware access so project-scoped "developer" members only
+	// see logs for the projects granted to them.
+	const accessibleProjectIds = new Set(await getUserProjectIds(user.id));
+	const projectIds = projects
+		.map((project) => project.id)
+		.filter((id) => accessibleProjectIds.has(id));
 
-	// If projectId is provided but not found in user's projects, deny access
+	// If projectId is provided but not found in user's accessible projects, deny
 	if (projectId && !projectIds.includes(projectId)) {
 		throw new HTTPException(403, {
 			message: "You don't have access to this project",
 		});
 	}
+
+	// Developers only see logs for the keys they created — a project grant does
+	// not entitle them to a teammate's request and response payloads.
+	const scope = await getApiKeyScope(user.id, projectIds);
 
 	// Check apiKeyId authorization if provided
 	if (apiKeyId) {
@@ -480,6 +546,15 @@ logs.openapi(get, async (c) => {
 				message: "You don't have access to this API key",
 			});
 		}
+
+		if (
+			scope.restrictedProjectIds.includes(apiKey.projectId) &&
+			!scope.ownApiKeyIds.includes(apiKey.id)
+		) {
+			throw new HTTPException(403, {
+				message: "You don't have access to this API key",
+			});
+		}
 	}
 
 	// Check providerKeyId authorization if provided
@@ -496,8 +571,13 @@ logs.openapi(get, async (c) => {
 			});
 		}
 
-		// Check if the provider key belongs to one of the user's organizations
-		if (!organizationIds.includes(providerKey.organizationId)) {
+		// Check if the provider key belongs to one of the user's organizations.
+		// Platform-managed credentials have no owning organization, so they are
+		// never accessible here.
+		if (
+			!providerKey.organizationId ||
+			!organizationIds.includes(providerKey.organizationId)
+		) {
 			throw new HTTPException(403, {
 				message: "You don't have access to this provider key",
 			});
@@ -514,6 +594,15 @@ logs.openapi(get, async (c) => {
 		whereConditions.push(inArray(tables.log.projectId, projectIds));
 	}
 
+	const scopeCondition = apiKeyScopeFilter(
+		scope,
+		tables.log.projectId,
+		tables.log.apiKeyId,
+	);
+	if (scopeCondition) {
+		whereConditions.push(scopeCondition);
+	}
+
 	// Add date range filters
 	if (startDate) {
 		whereConditions.push(gte(tables.log.createdAt, new Date(startDate)));
@@ -522,13 +611,14 @@ logs.openapi(get, async (c) => {
 		whereConditions.push(lte(tables.log.createdAt, new Date(endDate)));
 	}
 
-	// Add model filter - match the model name part after the slash,
+	// Add model filter - match the model id part after the slash and before any
+	// `:region` suffix (usedModel is stored as `provider/modelId[:region]`),
 	// or the full value if there's no slash (seed data / legacy format)
 	if (model) {
 		whereConditions.push(
 			sql`CASE WHEN ${tables.log.usedModel} LIKE '%/%'
-				THEN SPLIT_PART(${tables.log.usedModel}, '/', 2)
-				ELSE ${tables.log.usedModel}
+				THEN SPLIT_PART(SPLIT_PART(${tables.log.usedModel}, '/', 2), ':', 1)
+				ELSE SPLIT_PART(${tables.log.usedModel}, ':', 1)
 			END = ${model}`,
 		);
 	}
@@ -550,6 +640,11 @@ logs.openapi(get, async (c) => {
 		);
 	}
 
+	// Add billing mode filter
+	if (usedMode) {
+		whereConditions.push(eq(tables.log.usedMode, usedMode));
+	}
+
 	// Add apiKeyId filter
 	if (apiKeyId) {
 		whereConditions.push(eq(tables.log.apiKeyId, apiKeyId));
@@ -557,7 +652,7 @@ logs.openapi(get, async (c) => {
 
 	// Add providerKeyId filter
 	if (providerKeyId) {
-		// whereConditions.push(eq(tables.log.providerKeyId, providerKeyId));
+		whereConditions.push(eq(tables.log.providerKeyId, providerKeyId));
 	}
 
 	// Add custom header filter
@@ -787,9 +882,14 @@ logs.openapi(uniqueModelsGet, async (c) => {
 		});
 	}
 
-	const projectIds = projects.map((project) => project.id);
+	// Intersect with RBAC-aware access so project-scoped "developer" members only
+	// see logs for the projects granted to them.
+	const accessibleProjectIds = new Set(await getUserProjectIds(user.id));
+	const projectIds = projects
+		.map((project) => project.id)
+		.filter((id) => accessibleProjectIds.has(id));
 
-	// If projectId is provided but not found in user's projects, deny access
+	// If projectId is provided but not found in user's accessible projects, deny
 	if (projectId && !projectIds.includes(projectId)) {
 		throw new HTTPException(403, {
 			message: "You don't have access to this project",
@@ -802,6 +902,17 @@ logs.openapi(uniqueModelsGet, async (c) => {
 		whereConditions.push(eq(tables.log.projectId, projectId));
 	} else {
 		whereConditions.push(inArray(tables.log.projectId, projectIds));
+	}
+
+	// The filter options must describe the logs the caller can actually read, so
+	// a developer sees only the models and providers their own keys used.
+	const scopeCondition = apiKeyScopeFilter(
+		await getApiKeyScope(user.id, projectIds),
+		tables.log.projectId,
+		tables.log.apiKeyId,
+	);
+	if (scopeCondition) {
+		whereConditions.push(scopeCondition);
 	}
 
 	const finalWhereClause =
@@ -878,10 +989,21 @@ logs.openapi(getById, async (c) => {
 		throw new HTTPException(404, { message: "Log not found" });
 	}
 
-	// Verify user has access to this log's organization
-	const organizationIds = await getActiveUserOrganizationIds(user.id);
+	// Verify the user can access this log's project (RBAC-aware: developers are
+	// limited to their granted projects).
+	if (!(await userHasProjectAccess(user.id, log.projectId))) {
+		throw new HTTPException(403, {
+			message: "You don't have access to this log",
+		});
+	}
 
-	if (!organizationIds.includes(log.organizationId)) {
+	// Within a granted project, a developer may still only read their own keys'
+	// requests — the payload carries the full prompt and completion.
+	const scope = await getApiKeyScope(user.id, [log.projectId]);
+	if (
+		scope.restrictedProjectIds.includes(log.projectId) &&
+		!scope.ownApiKeyIds.includes(log.apiKeyId)
+	) {
 		throw new HTTPException(403, {
 			message: "You don't have access to this log",
 		});

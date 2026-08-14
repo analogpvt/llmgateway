@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { RequestError } from "./request-error.js";
 import {
 	googleProviderSupportsAudioFormat,
 	parseGoogleUpstreamDocumentError,
@@ -120,6 +121,33 @@ describe("transformGoogleMessages — audio MIME resolution", () => {
 			const e = err as UnsupportedAudioFormatError;
 			expect(e.format).toBe("aiff");
 			expect(e.providerTarget).toBe("Vertex AI");
+		}
+	});
+});
+
+describe("transformGoogleMessages — image URL processing errors", () => {
+	it("throws RequestError (400) for a non-HTTPS image URL in production", async () => {
+		const messages: BaseMessage[] = [
+			{
+				role: "user",
+				content: [
+					{
+						type: "image_url",
+						image_url: { url: "http://example.com/image.png" },
+					},
+				],
+			},
+		];
+		try {
+			await transformGoogleMessages(messages, true);
+			throw new Error("expected throw");
+		} catch (err) {
+			expect(err).toBeInstanceOf(RequestError);
+			const e = err as RequestError;
+			expect(e.statusCode).toBe(400);
+			expect(e.message).toBe(
+				"Failed to process image: Image URLs must use HTTPS protocol in production",
+			);
 		}
 	});
 });
@@ -307,6 +335,79 @@ describe("transformGoogleMessages — document file blocks", () => {
 				"google-ai-studio",
 			),
 		).rejects.toThrow(/file_data/);
+	});
+
+	it("transforms a large base64 document in ~constant time", async () => {
+		const tiny = "data:application/pdf;base64,QQ==";
+		const big = "data:application/pdf;base64," + "A".repeat(12 * 1024 * 1024); // 12 MB
+
+		async function timeTransform(
+			fileData: string,
+			iterations: number,
+		): Promise<number> {
+			const messages: BaseMessage[] = [
+				{
+					role: "user",
+					content: [
+						{
+							type: "file",
+							file: { filename: "doc.pdf", file_data: fileData },
+						},
+					],
+				},
+			];
+			await transformGoogleMessages(
+				messages,
+				false,
+				20,
+				null,
+				undefined,
+				"google-ai-studio",
+			); // warm up
+			const start = performance.now();
+			for (let i = 0; i < iterations; i++) {
+				await transformGoogleMessages(
+					messages,
+					false,
+					20,
+					null,
+					undefined,
+					"google-ai-studio",
+				);
+			}
+			return performance.now() - start;
+		}
+
+		const iterations = 50;
+		const tinyMs = await timeTransform(tiny, iterations);
+		const bigMs = await timeTransform(big, iterations);
+
+		// parseFileDataUrl never scans the base64 body, so a 12MB document costs
+		// ~the same as a 4-byte one. A `^data:...,(.*)$` regex would scan + copy
+		// 12MB per call (~3ms), blowing past this bound. The size-ratio check is
+		// CPU-speed independent; the +100ms slack absorbs CI noise.
+		const scaled = tinyMs * 10;
+		const bound = scaled + 100;
+		expect(bigMs).toBeLessThan(bound);
+
+		// Sanity: the payload is forwarded intact, not truncated.
+		const out = await transformGoogleMessages(
+			[
+				{
+					role: "user",
+					content: [
+						{ type: "file", file: { filename: "doc.pdf", file_data: big } },
+					],
+				},
+			],
+			false,
+			20,
+			null,
+			undefined,
+			"google-ai-studio",
+		);
+		const filePart = out[0].parts.find((p) => p.inline_data);
+		expect(filePart?.inline_data?.data.length).toBe(12 * 1024 * 1024);
 	});
 });
 

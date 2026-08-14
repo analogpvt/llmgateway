@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 
+import { useUser } from "@/hooks/useUser";
 import { Button } from "@/lib/components/button";
 import {
 	Dialog,
@@ -18,6 +19,7 @@ import {
 	ApiKeyLimitFields,
 	buildApiKeyLimitPayload,
 	createApiKeyLimitFormValue,
+	validateApiKeyLimitPayloadWithinMemberBudget,
 	type ApiKeyLimitPayload,
 } from "./api-key-limit-fields";
 
@@ -38,6 +40,12 @@ export function ApiKeyLimitsDialog({
 	const [open, setOpen] = useState(false);
 	const [isSubmitting, setIsSubmitting] = useState(false);
 	const [value, setValue] = useState(() => createApiKeyLimitFormValue(apiKey));
+	const { user } = useUser();
+	// Owners/admins edit keys they did not create, so the cap that applies is the
+	// key creator's member budget, not the viewer's own.
+	const memberBudget = apiKey.ownerBudget ?? null;
+	const budgetOwner = apiKey.createdBy === user?.id ? "self" : "other";
+	const ownerName = apiKey.creator?.name ?? apiKey.creator?.email ?? null;
 
 	useEffect(() => {
 		if (!open) {
@@ -65,6 +73,16 @@ export function ApiKeyLimitsDialog({
 							return;
 						}
 
+						const budgetError = validateApiKeyLimitPayloadWithinMemberBudget(
+							payload,
+							memberBudget,
+							budgetOwner,
+						);
+						if (budgetError) {
+							toast({ title: budgetError, variant: "destructive" });
+							return;
+						}
+
 						setIsSubmitting(true);
 						try {
 							await onSubmit(payload);
@@ -88,6 +106,9 @@ export function ApiKeyLimitsDialog({
 							idPrefix={`api-key-limit-${apiKey.id}`}
 							value={value}
 							onChange={setValue}
+							memberBudget={memberBudget}
+							budgetOwner={budgetOwner}
+							ownerName={ownerName}
 						/>
 					</div>
 					<DialogFooter className="pt-8">

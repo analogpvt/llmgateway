@@ -11,6 +11,7 @@ import {
 	Coins,
 	Copy,
 	Check,
+	Filter,
 	Globe,
 	Info,
 	Package,
@@ -34,6 +35,16 @@ import {
 } from "@/lib/components/tooltip";
 import { useApi } from "@/lib/fetch-client";
 import { cn } from "@/lib/utils";
+
+import {
+	formatServiceTierMultiplier,
+	getServiceTier,
+} from "@llmgateway/models";
+import { regionFromUsedModel } from "@llmgateway/shared";
+import {
+	API_ORIGIN_LABELS,
+	CredentialSourceBadge,
+} from "@llmgateway/shared/components";
 
 import type { LogDetailData } from "@/types/activity";
 import type { Log } from "@llmgateway/db";
@@ -196,6 +207,34 @@ function formatDuration(ms: number) {
 		return `${ms}ms`;
 	}
 	return `${(ms / 1000).toFixed(2)}s`;
+}
+
+// Selection reasons where the weighted-score formula is bypassed entirely, so
+// every provider's score is a hardcoded 0 placeholder rather than a real value.
+// "session-sticky" is intentionally excluded: it scores providers with the
+// normal weighted algorithm and pins the result for the session, so the logged
+// scores are real values worth surfacing. The all-zero fallback below hides
+// those scores when they couldn't be computed (no metrics available).
+const SCORE_BYPASSED_SELECTION_REASONS = new Set([
+	"random-exploration",
+	"price-only-no-metrics",
+]);
+
+// The per-provider score only carries information when scoring actually ran.
+// Exploration/price-only paths emit 0 for every provider, and "stable-preferred"
+// can layer on top of a sticky pick, so treat an all-zero set as "scoring did
+// not run" regardless of the reason.
+function isProviderScoreMeaningful(
+	selectionReason: string | null | undefined,
+	providerScores: { score: number }[],
+): boolean {
+	if (
+		selectionReason &&
+		SCORE_BYPASSED_SELECTION_REASONS.has(selectionReason)
+	) {
+		return false;
+	}
+	return providerScores.some((s) => s.score !== 0);
 }
 
 function isBase64ImageChar(char: string) {
@@ -430,15 +469,24 @@ export function LogDetailClient({
 
 	const inputImages = extractMessageImages(log.messages);
 
+	// Regional mappings encode the served region as a `:region` suffix on
+	// `usedModel`; providers without regional deployments have none.
+	const usedRegion = regionFromUsedModel(log.usedModel, log.usedProvider);
+
 	const retentionEnabled =
 		log.dataStorageCost !== null &&
 		log.dataStorageCost !== undefined &&
 		Number(log.dataStorageCost) > 0;
 
 	const throughput =
-		log.duration && log.totalTokens
-			? (Number(log.totalTokens) / (log.duration / 1000)).toFixed(1)
+		log.duration && log.completionTokens
+			? (Number(log.completionTokens) / (log.duration / 1000)).toFixed(1)
 			: null;
+
+	// Reasoning models stream thinking before any content, so the first
+	// reasoning token is the real first-token latency when present.
+	const timeToFirstToken =
+		log.timeToFirstReasoningToken ?? log.timeToFirstToken;
 
 	return (
 		<div className="flex flex-col">
@@ -509,14 +557,14 @@ export function LogDetailClient({
 							{throughput ? `${throughput} t/s` : "-"}
 						</p>
 					</div>
-					{log.timeToFirstToken && (
+					{timeToFirstToken && (
 						<div className="rounded-lg border bg-card p-3">
 							<div className="flex items-center gap-2 text-muted-foreground mb-1">
 								<Clock className="h-3.5 w-3.5" />
 								<span className="text-xs">TTFT</span>
 							</div>
 							<p className="text-lg font-semibold tabular-nums">
-								{formatDuration(log.timeToFirstToken)}
+								{formatDuration(timeToFirstToken)}
 							</p>
 						</div>
 					)}
@@ -584,6 +632,7 @@ export function LogDetailClient({
 									/>
 								)}
 								<Field label="Provider" value={log.usedProvider} />
+								{usedRegion && <Field label="Region" value={usedRegion} mono />}
 								{log.requestedProvider && (
 									<Field
 										label="Requested Provider"
@@ -633,12 +682,28 @@ export function LogDetailClient({
 									{log.routingMetadata.usedApiKeyHash && (
 										<Field
 											label="Key"
-											value={formatApiKeyHash(
-												log.routingMetadata.usedApiKeyHash,
-											)}
+											value={
+												<span className="inline-flex items-center gap-1.5">
+													{formatApiKeyHash(log.routingMetadata.usedApiKeyHash)}
+													<CredentialSourceBadge
+														source={log.routingMetadata.usedCredentialSource}
+														keyLabel={log.routingMetadata.usedProviderKeyLabel}
+													/>
+												</span>
+											}
 											mono
 										/>
 									)}
+									{log.routingMetadata.eligibleProviderKeys &&
+										log.routingMetadata.eligibleProviderKeys.length > 0 && (
+											<Field
+												label="Your keys"
+												value={log.routingMetadata.eligibleProviderKeys
+													.map((key) => key.label ?? key.id)
+													.join(", ")}
+												mono
+											/>
+										)}
 									{log.routingMetadata.availableProviders &&
 										log.routingMetadata.availableProviders.length > 0 && (
 											<Field
@@ -650,79 +715,87 @@ export function LogDetailClient({
 											/>
 										)}
 									{log.routingMetadata.providerScores &&
-										log.routingMetadata.providerScores.length > 0 && (
-											<div className="mt-3 pt-3 border-t border-border/50">
-												<p className="text-xs text-muted-foreground mb-2">
-													Provider Scores
-												</p>
-												<div className="space-y-1.5">
-													{log.routingMetadata.providerScores.map((score) => (
-														<div
-															key={`${score.providerId}-${score.region ?? "default"}`}
-															className="flex items-center justify-between text-xs font-mono"
-														>
-															<span className="flex items-center gap-1.5">
-																{score.providerId}
-																{score.region && (
-																	<span className="text-muted-foreground">
-																		({score.region})
-																	</span>
-																)}
-																{score.failed && (
-																	<span className="inline-flex items-center gap-0.5 text-red-500">
-																		<AlertCircle className="h-3 w-3" />
-																		<span>
-																			{score.status_code}
-																			{score.error_type && (
-																				<span className="ml-0.5 text-red-400">
-																					{score.error_type}
-																				</span>
-																			)}
+										log.routingMetadata.providerScores.length > 0 &&
+										(() => {
+											const scores = log.routingMetadata?.providerScores ?? [];
+											const showScore = isProviderScoreMeaningful(
+												log.routingMetadata?.selectionReason,
+												scores,
+											);
+											return (
+												<div className="mt-3 pt-3 border-t border-border/50">
+													<p className="text-xs text-muted-foreground mb-2">
+														Provider Scores
+													</p>
+													<div className="space-y-1.5">
+														{scores.map((score) => (
+															<div
+																key={`${score.providerId}-${score.region ?? "default"}`}
+																className="flex items-center justify-between text-xs font-mono"
+															>
+																<span className="flex items-center gap-1.5">
+																	{score.providerId}
+																	{score.region && (
+																		<span className="text-muted-foreground">
+																			({score.region})
 																		</span>
-																	</span>
-																)}
-																{score.rate_limited && (
-																	<span className="inline-flex items-center gap-0.5 text-amber-500">
-																		<Clock className="h-3 w-3" />
-																		<span>rpm capped</span>
-																	</span>
-																)}
-																{score.excludedByContentFilter && (
-																	<span className="inline-flex items-center gap-0.5 text-amber-500">
-																		<Ban className="h-3 w-3" />
-																		<span>content filter</span>
-																	</span>
-																)}
-															</span>
-															<span className="text-muted-foreground font-mono">
-																{score.score.toFixed(2)}
-																{score.uptime !== undefined && (
-																	<span className="ml-2">
-																		{score.uptime?.toFixed(0)}% up
-																	</span>
-																)}
-																{score.throughput !== undefined && (
-																	<span className="ml-2">
-																		{score.throughput?.toFixed(0)}t/s
-																	</span>
-																)}
-																{score.latency !== undefined && (
-																	<span className="ml-2">
-																		{score.latency?.toFixed(0)}ms
-																	</span>
-																)}
-																{score.price !== undefined && (
-																	<span className="ml-2">${score.price}</span>
-																)}
-																{score.cacheSupported && (
-																	<span className="ml-2">cache</span>
-																)}
-															</span>
-														</div>
-													))}
+																	)}
+																	{score.failed && (
+																		<span className="inline-flex items-center gap-0.5 text-red-500">
+																			<AlertCircle className="h-3 w-3" />
+																			<span>
+																				{score.status_code}
+																				{score.error_type && (
+																					<span className="ml-0.5 text-red-400">
+																						{score.error_type}
+																					</span>
+																				)}
+																			</span>
+																		</span>
+																	)}
+																	{score.rate_limited && (
+																		<span className="inline-flex items-center gap-0.5 text-amber-500">
+																			<Clock className="h-3 w-3" />
+																			<span>rpm capped</span>
+																		</span>
+																	)}
+																	{score.excludedByContentFilter && (
+																		<span className="inline-flex items-center gap-0.5 text-amber-500">
+																			<Ban className="h-3 w-3" />
+																			<span>content filter</span>
+																		</span>
+																	)}
+																</span>
+																<span className="text-muted-foreground font-mono">
+																	{showScore && score.score.toFixed(2)}
+																	{score.uptime !== undefined && (
+																		<span className="ml-2">
+																			{score.uptime?.toFixed(0)}% up
+																		</span>
+																	)}
+																	{score.throughput !== undefined && (
+																		<span className="ml-2">
+																			{score.throughput?.toFixed(0)}t/s
+																		</span>
+																	)}
+																	{score.latency !== undefined && (
+																		<span className="ml-2">
+																			{score.latency?.toFixed(0)}ms
+																		</span>
+																	)}
+																	{score.price !== undefined && (
+																		<span className="ml-2">${score.price}</span>
+																	)}
+																	{score.cacheSupported && (
+																		<span className="ml-2">cache</span>
+																	)}
+																</span>
+															</div>
+														))}
+													</div>
 												</div>
-											</div>
-										)}
+											);
+										})()}
 									{log.routingMetadata.routing &&
 										log.routingMetadata.routing.length > 0 && (
 											<div className="mt-3 pt-3 border-t border-border/50">
@@ -752,6 +825,10 @@ export function LogDetailClient({
 																		key {formatApiKeyHash(attempt.apiKeyHash)}
 																	</span>
 																)}
+																<CredentialSourceBadge
+																	source={attempt.credentialSource}
+																	keyLabel={attempt.providerKeyLabel}
+																/>
 																{attempt.logId && (
 																	<Link
 																		href={`/dashboard/${orgId}/${projectId}/activity/${attempt.logId}`}
@@ -768,6 +845,43 @@ export function LogDetailClient({
 														</div>
 													))}
 												</div>
+											</div>
+										)}
+									{log.routingMetadata.filteredProviders &&
+										log.routingMetadata.filteredProviders.length > 0 && (
+											<div className="mt-3 pt-3 border-t border-border/50">
+												<p className="text-xs text-muted-foreground mb-2 flex items-center gap-1">
+													<Filter className="h-3 w-3" />
+													Filtered Providers
+												</p>
+												<div className="space-y-1.5">
+													{log.routingMetadata.filteredProviders.map(
+														(filtered) => (
+															<div
+																key={filtered.providerId}
+																className="flex items-center justify-between text-xs font-mono"
+															>
+																<span className="text-amber-600">
+																	{filtered.providerId}
+																</span>
+																<span className="text-muted-foreground text-right">
+																	{filtered.reasons.join(", ")}
+																</span>
+															</div>
+														),
+													)}
+												</div>
+											</div>
+										)}
+									{log.routingMetadata.strippedParameters &&
+										log.routingMetadata.strippedParameters.length > 0 && (
+											<div className="mt-3 pt-3 border-t border-border/50">
+												<p className="text-xs text-muted-foreground mb-2">
+													Stripped Parameters
+												</p>
+												<p className="text-xs font-mono text-amber-600">
+													{log.routingMetadata.strippedParameters.join(", ")}
+												</p>
 											</div>
 										)}
 								</div>
@@ -885,6 +999,42 @@ export function LogDetailClient({
 										{log.pricingTier && (
 											<Field label="Pricing Tier" value={log.pricingTier} />
 										)}
+										{log.requestedServiceTier && (
+											<Field
+												label="Requested Service Tier"
+												value={
+													log.requestedServiceTier.charAt(0).toUpperCase() +
+													log.requestedServiceTier.slice(1) +
+													(log.routingMetadata?.serviceTierSource ===
+													"coding-plan-default"
+														? " (coding plan default)"
+														: "")
+												}
+											/>
+										)}
+										{log.usedServiceTier &&
+											(() => {
+												const tierName =
+													log.usedServiceTier.charAt(0).toUpperCase() +
+													log.usedServiceTier.slice(1);
+												const tier = getServiceTier(
+													log.usedProvider ?? "",
+													log.usedServiceTier,
+												);
+												const multiplier = tier
+													? formatServiceTierMultiplier(tier.multiplier)
+													: "";
+												return (
+													<Field
+														label="Used Service Tier"
+														value={
+															multiplier
+																? `${tierName} (${multiplier})`
+																: tierName
+														}
+													/>
+												);
+											})()}
 									</div>
 								</div>
 								<div className="border-t border-border/50 pt-4">
@@ -920,6 +1070,20 @@ export function LogDetailClient({
 										value={log.cacheWriteTokens}
 									/>
 								)}
+								{log.cacheWrite5mTokens &&
+									Number(log.cacheWrite5mTokens) > 0 && (
+										<Field
+											label="Cache Write Tokens (5m TTL)"
+											value={log.cacheWrite5mTokens}
+										/>
+									)}
+								{log.cacheWrite1hTokens &&
+									Number(log.cacheWrite1hTokens) > 0 && (
+										<Field
+											label="Cache Write Tokens (1h TTL)"
+											value={log.cacheWrite1hTokens}
+										/>
+									)}
 								{log.reasoningTokens && (
 									<Field label="Reasoning Tokens" value={log.reasoningTokens} />
 								)}
@@ -1083,6 +1247,14 @@ export function LogDetailClient({
 											name={log.apiKeyName}
 											copyLabel="Copy API key ID"
 										/>
+									}
+								/>
+								<Field
+									label="API Origin"
+									value={
+										log.apiOrigin
+											? (API_ORIGIN_LABELS[log.apiOrigin] ?? log.apiOrigin)
+											: "—"
 									}
 								/>
 								<Field label="Mode" value={log.mode || "?"} />
@@ -1271,6 +1443,17 @@ export function LogDetailClient({
 									{log.errorDetails.responseText}
 								</pre>
 							</div>
+							{/* Network failures surface as a bare "fetch failed" message; the
+							    underlying reason (timeouts, DNS, TLS, connection resets) only
+							    exists in the cause chain, so it has to be shown separately. */}
+							{!!log.errorDetails.cause && (
+								<div>
+									<p className="text-xs text-red-400 mb-1">Cause</p>
+									<pre className="text-xs overflow-auto whitespace-pre-wrap break-all font-mono bg-background rounded border p-3">
+										{log.errorDetails.cause}
+									</pre>
+								</div>
+							)}
 							{log.retried && log.retriedByLogId && (
 								<div className="flex items-center gap-2 rounded-md border border-amber-500/20 bg-amber-500/10 p-3 text-sm">
 									<RefreshCw className="h-4 w-4 text-amber-600" />

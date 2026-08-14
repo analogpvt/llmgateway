@@ -4,6 +4,7 @@ import { ChevronDown, ChevronRight, Shield } from "lucide-react";
 import Link from "next/link";
 import { Fragment, useState } from "react";
 
+import { CopyableId } from "@/components/copyable-id";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -14,6 +15,9 @@ import {
 	TableHeader,
 	TableRow,
 } from "@/components/ui/table";
+import { KEY_STATUS_DEFAULT, type KeyStatusFilter } from "@/lib/key-status";
+
+import { KeyStatusFilter as KeyStatusFilterControl } from "./key-status-filter";
 
 import type { paths } from "@/lib/api/v1";
 
@@ -73,6 +77,23 @@ function formatRuleValue(rule: IamRule): string {
 	return "—";
 }
 
+function buildHref(
+	orgId: string,
+	txPage: number,
+	akPage: number,
+	akStatus: KeyStatusFilter,
+) {
+	const params = new URLSearchParams({
+		tab: "api-keys",
+		txPage: String(txPage),
+		akPage: String(akPage),
+	});
+	if (akStatus !== KEY_STATUS_DEFAULT) {
+		params.set("akStatus", akStatus);
+	}
+	return `/organizations/${orgId}?${params.toString()}`;
+}
+
 interface ApiKeysTableProps {
 	apiKeys: ApiKey[];
 	orgId: string;
@@ -82,6 +103,8 @@ interface ApiKeysTableProps {
 	akLimit: number;
 	akTotal: number;
 	akTotalPages: number;
+	akStatus: KeyStatusFilter;
+	counts: ApiKeysResponse["counts"];
 }
 
 export function ApiKeysTable({
@@ -93,6 +116,8 @@ export function ApiKeysTable({
 	akLimit,
 	akTotal,
 	akTotalPages,
+	akStatus,
+	counts,
 }: ApiKeysTableProps) {
 	const [expanded, setExpanded] = useState<Record<string, boolean>>({});
 
@@ -102,12 +127,21 @@ export function ApiKeysTable({
 
 	return (
 		<div className="space-y-4">
+			<KeyStatusFilterControl
+				param="akStatus"
+				tab="api-keys"
+				pageParam="akPage"
+				value={akStatus}
+				counts={counts}
+			/>
+
 			<div className="overflow-x-auto rounded-lg border border-border/60 bg-card">
 				<Table>
 					<TableHeader>
 						<TableRow>
 							<TableHead className="w-10" />
 							<TableHead>Token</TableHead>
+							<TableHead>ID</TableHead>
 							<TableHead>Description</TableHead>
 							<TableHead>Project</TableHead>
 							<TableHead>Usage</TableHead>
@@ -120,10 +154,12 @@ export function ApiKeysTable({
 						{apiKeys.length === 0 ? (
 							<TableRow>
 								<TableCell
-									colSpan={8}
+									colSpan={9}
 									className="h-24 text-center text-muted-foreground"
 								>
-									No API keys found
+									{akStatus === "all"
+										? "No API keys found"
+										: `No ${akStatus === "inactive" ? "disabled" : akStatus} API keys found`}
 								</TableCell>
 							</TableRow>
 						) : (
@@ -155,6 +191,9 @@ export function ApiKeysTable({
 											</TableCell>
 											<TableCell className="font-mono text-xs">
 												{apiKey.token.slice(0, 12)}...
+											</TableCell>
+											<TableCell>
+												<CopyableId id={apiKey.id} />
 											</TableCell>
 											<TableCell className="max-w-[200px] truncate">
 												{apiKey.description ?? "—"}
@@ -202,7 +241,7 @@ export function ApiKeysTable({
 										{isOpen && ruleCount > 0 && (
 											<TableRow className="bg-muted/30 hover:bg-muted/30">
 												<TableCell />
-												<TableCell colSpan={7} className="py-3">
+												<TableCell colSpan={8} className="py-3">
 													<div className="space-y-2">
 														<div className="text-xs font-medium text-muted-foreground">
 															IAM Rules ({ruleCount})
@@ -272,7 +311,7 @@ export function ApiKeysTable({
 					<div className="flex items-center gap-2">
 						<Button variant="outline" size="sm" asChild disabled={akPage <= 1}>
 							<Link
-								href={`/organizations/${orgId}?tab=api-keys&txPage=${txPage}&akPage=${akPage - 1}`}
+								href={buildHref(orgId, txPage, akPage - 1, akStatus)}
 								className={akPage <= 1 ? "pointer-events-none opacity-50" : ""}
 							>
 								Previous
@@ -288,7 +327,7 @@ export function ApiKeysTable({
 							disabled={akPage >= akTotalPages}
 						>
 							<Link
-								href={`/organizations/${orgId}?tab=api-keys&txPage=${txPage}&akPage=${akPage + 1}`}
+								href={buildHref(orgId, txPage, akPage + 1, akStatus)}
 								className={
 									akPage >= akTotalPages ? "pointer-events-none opacity-50" : ""
 								}

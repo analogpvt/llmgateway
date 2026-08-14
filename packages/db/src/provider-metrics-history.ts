@@ -9,6 +9,7 @@ import {
 import { cdb } from "./cdb.js";
 import { metricsKey, type ProviderMetrics } from "./provider-metrics.js";
 import { modelProviderMappingHistory } from "./schema.js";
+import { effectiveTtftTotals } from "./ttft.js";
 
 const historyTableName = getTableName(modelProviderMappingHistory);
 
@@ -23,6 +24,8 @@ interface HistoryRow {
 	weightedOutputTokens: string | number | null;
 	weightedTTFT: string | number | null;
 	weightedTTFRT: string | number | null;
+	weightedTTFTCount: string | number | null;
+	weightedTTFRTCount: string | number | null;
 }
 
 function rowToMetrics(row: HistoryRow): ProviderMetrics | undefined {
@@ -33,6 +36,8 @@ function rowToMetrics(row: HistoryRow): ProviderMetrics | undefined {
 	const weightedOutputTokens = Number(row.weightedOutputTokens ?? 0);
 	const weightedTTFT = Number(row.weightedTTFT ?? 0);
 	const weightedTTFRT = Number(row.weightedTTFRT ?? 0);
+	const weightedTTFTCount = Number(row.weightedTTFTCount ?? 0);
+	const weightedTTFRTCount = Number(row.weightedTTFRTCount ?? 0);
 
 	if (totalLogs <= 0 || weightedLogs <= 0) {
 		return undefined;
@@ -41,9 +46,20 @@ function rowToMetrics(row: HistoryRow): ProviderMetrics | undefined {
 	const successfulRequests = weightedLogs - weightedRoutingErrors;
 	const uptime = Math.max(0, (successfulRequests / weightedLogs) * 100);
 
-	const effectiveTTFT = weightedTTFRT > 0 ? weightedTTFRT : weightedTTFT;
+	// Only streamed requests record a first-token latency, so each average
+	// divides by its own sample count. Dividing by the request count instead
+	// would make providers look faster the more non-streaming traffic they see.
+	const { total: effectiveTTFT, count: effectiveTTFTCount } =
+		effectiveTtftTotals({
+			totalTimeToFirstToken: weightedTTFT,
+			timeToFirstTokenCount: weightedTTFTCount,
+			totalTimeToFirstReasoningToken: weightedTTFRT,
+			timeToFirstReasoningTokenCount: weightedTTFRTCount,
+		});
 	const averageLatency =
-		effectiveTTFT > 0 ? effectiveTTFT / weightedLogs : undefined;
+		effectiveTTFT > 0 && effectiveTTFTCount > 0
+			? effectiveTTFT / effectiveTTFTCount
+			: undefined;
 
 	const throughput =
 		weightedDuration > 0
@@ -68,7 +84,10 @@ const HISTORY_SWR_TTL_SECONDS = 30;
  * Runs a weighted aggregation against model_provider_mapping_history with
  * the supplied tier weights. SWR-cached by (history-config-hash, modelIds)
  * so concurrent requests with the same model set + history config share
- * one DB hit, and so the gateway stays warm if Postgres falls over.
+ * one DB hit, and so the gateway stays warm if Postgres falls over. The
+ * underlying Drizzle cache is pinned to a stable tag (see below) so the
+ * per-request time-window params don't bust the key; it expires on the TTL
+ * alone so high throughput doesn't translate into constant aggregations.
  */
 export async function getProviderMetricsFromHistory(
 	combinations: Array<{
@@ -92,7 +111,9 @@ export async function getProviderMetricsFromHistory(
 		);
 	}
 
-	const cacheKey = `providerMetrics:history:${routingHistoryCacheKey(history)}:${modelIds.join(",")}`;
+	// The version segment is bumped whenever the selected columns change so a
+	// rolling deploy doesn't read rows cached in the previous shape.
+	const cacheKey = `providerMetrics:history:v2:${routingHistoryCacheKey(history)}:${modelIds.join(",")}`;
 
 	const rows = await swrWrap<HistoryRow[]>(
 		cacheKey,
@@ -146,6 +167,14 @@ export async function getProviderMetricsFromHistory(
 						sql<string>`coalesce(sum(${modelProviderMappingHistory.totalTimeToFirstReasoningToken} * ${weightExpr}), 0)::bigint`.as(
 							"weighted_ttfrt",
 						),
+					weightedTTFTCount:
+						sql<string>`coalesce(sum(${modelProviderMappingHistory.timeToFirstTokenCount} * ${weightExpr}), 0)::bigint`.as(
+							"weighted_ttft_count",
+						),
+					weightedTTFRTCount:
+						sql<string>`coalesce(sum(${modelProviderMappingHistory.timeToFirstReasoningTokenCount} * ${weightExpr}), 0)::bigint`.as(
+							"weighted_ttfrt_count",
+						),
 				})
 				.from(modelProviderMappingHistory)
 				.where(
@@ -158,7 +187,21 @@ export async function getProviderMetricsFromHistory(
 					modelProviderMappingHistory.modelId,
 					modelProviderMappingHistory.providerId,
 				)
-				.$withCache({ config: { ex: HISTORY_SWR_TTL_SECONDS } });
+				// Pin a stable cache tag. Without it, Drizzle keys the cache on
+				// hashQuery(sql, params), and the params include windowStart/tier
+				// boundaries derived from Date.now() at millisecond precision — so
+				// every request produced a unique key and the cache never hit,
+				// forcing the heavy weighted aggregation to run against Postgres on
+				// every request (catastrophic under high throughput). The tag is the
+				// same timestamp-independent key the SWR mirror uses, so requests
+				// with the same model set + history config share one cached result.
+				// autoInvalidate is off: routing metrics tolerate up to
+				// HISTORY_SWR_TTL_SECONDS of staleness and expire on the TTL alone.
+				.$withCache({
+					tag: cacheKey,
+					autoInvalidate: false,
+					config: { ex: HISTORY_SWR_TTL_SECONDS },
+				});
 
 			return result as unknown as HistoryRow[];
 		},

@@ -4,6 +4,15 @@
 
 import type { ProviderId } from "./providers.js";
 
+/**
+ * OpenAI explicit prompt cache breakpoint marker (GPT-5.6 and later families).
+ * Placed on a content part to end a cacheable prefix when the request uses
+ * `prompt_cache_options.mode: "explicit"`.
+ */
+export interface PromptCacheBreakpoint {
+	mode?: "explicit";
+}
+
 // Base content types
 export interface TextContent {
 	type: "text";
@@ -12,6 +21,7 @@ export interface TextContent {
 		type: "ephemeral";
 		ttl?: "5m" | "1h";
 	};
+	prompt_cache_breakpoint?: PromptCacheBreakpoint;
 }
 
 export interface ImageUrlContent {
@@ -20,6 +30,7 @@ export interface ImageUrlContent {
 		url: string;
 		detail?: "low" | "high" | "auto";
 	};
+	prompt_cache_breakpoint?: PromptCacheBreakpoint;
 }
 
 export interface ImageContent {
@@ -49,6 +60,7 @@ export interface InputAudioContent {
 			| "pcm"
 			| "webm";
 	};
+	prompt_cache_breakpoint?: PromptCacheBreakpoint;
 }
 
 export interface FileContent {
@@ -58,6 +70,7 @@ export interface FileContent {
 		file_data?: string;
 		file_id?: string;
 	};
+	prompt_cache_breakpoint?: PromptCacheBreakpoint;
 }
 
 export interface ToolUseContent {
@@ -70,7 +83,21 @@ export interface ToolUseContent {
 export interface ToolResultContent {
 	type: "tool_result";
 	tool_use_id: string;
-	content: string;
+	// Anthropic accepts a block array here as well as a plain string; the array
+	// form is what carries `tool_reference` blocks for a client-side tool search.
+	content: string | AnthropicNativeBlock[];
+}
+
+/**
+ * Anthropic content block with no OpenAI-format equivalent — currently the
+ * server-side tool search pair (`server_tool_use` + `tool_search_tool_result`)
+ * and the `tool_reference` blocks a client-side tool search returns. Carried
+ * verbatim between the caller and the Anthropic Messages API and dropped for
+ * every other upstream.
+ */
+export interface AnthropicNativeBlock {
+	type: string;
+	[key: string]: unknown;
 }
 
 export type MessageContent =
@@ -108,6 +135,31 @@ export interface BaseMessage {
 	reasoning?: string;
 	reasoning_content?: string;
 	reasoning_details?: ReasoningDetail[];
+	// OpenAI Responses assistant-message phase, replayed upstream on the
+	// Responses API path and stripped for chat-completions upstreams.
+	phase?: "commentary" | "final_answer";
+	// Marks assistant content that preceded the message's tool calls (pre-tool
+	// commentary), so Responses API replay preserves the original item order.
+	// Stripped for chat-completions upstreams.
+	content_before_tool_calls?: boolean;
+	// Separate phased assistant message items (e.g. commentary + final_answer)
+	// emitted by OpenAI Responses API models in one turn. `preceding_tool_calls`
+	// is how many of the message's tool calls came before the item, so the
+	// exact interleaving can be reconstructed. Replayed upstream as individual
+	// message items; stripped for chat-completions upstreams (the concatenated
+	// `content` carries the text there).
+	message_items?: Array<{
+		text: string;
+		phase?: "commentary" | "final_answer";
+		preceding_tool_calls?: number;
+	}>;
+	// Anthropic content blocks that survive a round trip verbatim because the
+	// OpenAI format has no equivalent. On an assistant message these are the
+	// server-side tool search blocks, spliced back in ahead of the tool_use
+	// blocks; on a tool message they are the `tool_result` content array, which
+	// is how a client-side tool search returns `tool_reference` blocks. Replayed
+	// on the Anthropic Messages API only and stripped for every other upstream.
+	anthropic_native_blocks?: AnthropicNativeBlock[];
 }
 
 // Provider-specific message formats
@@ -117,7 +169,7 @@ export interface OpenAIMessage extends BaseMessage {
 
 export interface AnthropicMessage {
 	role: "user" | "assistant";
-	content: MessageContent[];
+	content: (MessageContent | AnthropicNativeBlock)[];
 }
 
 export interface GoogleMessage {
@@ -160,6 +212,12 @@ export interface OpenAIFunctionToolInput {
 		description?: string;
 		parameters?: FunctionParameter | Record<string, any>;
 	};
+	/**
+	 * Anthropic-only: keep this tool out of the rendered tools section so it
+	 * never enters the cached prompt prefix, and load it on demand when the
+	 * tool search tool discovers it. Stripped for every other upstream.
+	 */
+	defer_loading?: boolean;
 }
 
 // Web search tool input type
@@ -175,10 +233,24 @@ export interface OpenAIWebSearchToolInput {
 	max_uses?: number;
 }
 
-// Compatible type for API requests - accepts both function and web_search tools
+/**
+ * Anthropic's server-side tool search tool. It has no OpenAI equivalent, so it
+ * travels through the gateway under its own `type` and is emitted verbatim on
+ * the Anthropic Messages API and dropped everywhere else.
+ */
+export interface OpenAIToolSearchToolInput {
+	type: "tool_search";
+	/** Anthropic tool type, e.g. `tool_search_tool_regex_20251119`. */
+	tool_search_type: string;
+	name?: string;
+}
+
+// Compatible type for API requests - accepts function, web_search and
+// tool_search tools
 export type OpenAIToolInput =
 	| OpenAIFunctionToolInput
-	| OpenAIWebSearchToolInput;
+	| OpenAIWebSearchToolInput
+	| OpenAIToolSearchToolInput;
 
 export interface AnthropicTool {
 	name: string;
@@ -204,9 +276,52 @@ export type ToolChoiceType =
 			function: {
 				name: string;
 			};
+	  }
+	| {
+			/**
+			 * Demands a web search rather than offering one. Consumed by the
+			 * gateway (as `WebSearchTool.forced`) rather than forwarded upstream,
+			 * since no provider accepts it under this name in a chat body.
+			 */
+			type: "web_search";
+	  };
+
+/**
+ * `tool_choice` as the OpenAI Responses API expects it. A named function
+ * choice is flat here, while Chat Completions nests the name under
+ * `function` — sending the nested form to a Responses upstream is rejected
+ * (Bedrock Mantle answers `Invalid 'tool_choice': value did not match any
+ * expected variant`).
+ */
+export type ResponsesToolChoice =
+	| "auto"
+	| "none"
+	| "required"
+	| {
+			type: "function";
+			name: string;
+	  }
+	| {
+			/**
+			 * Forces the native web search tool. Accepted by the Responses API
+			 * only — OpenAI's chat completions endpoint rejects a `web_search`
+			 * tool outright ("Supported values are: 'function' and 'custom'").
+			 */
+			type: "web_search";
 	  };
 
 export type PromptCacheRetention = "in_memory" | "24h";
+
+/**
+ * OpenAI explicit prompt caching controls (GPT-5.6 and later families).
+ * `mode: "explicit"` disables the automatic breakpoint on the latest message
+ * and caches only content parts carrying a `prompt_cache_breakpoint` marker.
+ * `ttl` currently only supports "30m" upstream.
+ */
+export interface PromptCacheOptions {
+	mode?: "implicit" | "explicit";
+	ttl?: "30m";
+}
 
 export type AnthropicToolChoice =
 	| "auto"
@@ -226,6 +341,7 @@ export interface BaseRequestBody {
 	frequency_penalty?: number;
 	presence_penalty?: number;
 	stream?: boolean;
+	service_tier?: "auto" | "default" | "flex" | "priority";
 }
 
 export interface OpenAIRequestBody extends BaseRequestBody {
@@ -234,6 +350,7 @@ export interface OpenAIRequestBody extends BaseRequestBody {
 	tool_choice?: ToolChoiceType;
 	prompt_cache_key?: string;
 	prompt_cache_retention?: PromptCacheRetention;
+	prompt_cache_options?: PromptCacheOptions;
 	response_format?: {
 		type: "text" | "json_object" | "json_schema";
 		json_schema?: {
@@ -246,7 +363,10 @@ export interface OpenAIRequestBody extends BaseRequestBody {
 	stream_options?: {
 		include_usage: boolean;
 	};
-	reasoning_effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+	reasoning_effort?:
+		"none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+	verbosity?: "low" | "medium" | "high";
+	n?: number;
 	extra_body?: Record<string, unknown>;
 }
 
@@ -263,32 +383,56 @@ export interface OpenAIResponsesFunctionCallOutput {
 	output: string;
 }
 
+export interface OpenAIResponsesReasoningItem {
+	type: "reasoning";
+	id?: string;
+	summary: unknown[];
+	encrypted_content: string;
+}
+
 export type OpenAIResponsesInputItem =
 	| OpenAIMessage
 	| OpenAIResponsesFunctionCall
-	| OpenAIResponsesFunctionCallOutput;
+	| OpenAIResponsesFunctionCallOutput
+	| OpenAIResponsesReasoningItem;
 
 export interface OpenAIResponsesRequestBody {
 	model: string;
 	input: OpenAIResponsesInputItem[];
+	service_tier?: "auto" | "default" | "flex" | "priority";
 	prompt_cache_key?: string;
 	prompt_cache_retention?: PromptCacheRetention;
+	prompt_cache_options?: PromptCacheOptions;
 	reasoning: {
-		effort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh";
+		effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 		summary: "detailed";
+		context?: "auto" | "current_turn" | "all_turns";
 	};
+	/**
+	 * Provider-side response storage (Responses API statefulness). The gateway
+	 * reconstructs conversations itself and never reads stored responses, so
+	 * providers that retain stored responses by default (Bedrock Mantle:
+	 * 30 days) get an explicit false.
+	 */
+	store?: boolean;
+	/**
+	 * Extra output data to request. `reasoning.encrypted_content` returns
+	 * encrypted reasoning payloads, which the gateway replays on later turns to
+	 * preserve reasoning without stored responses.
+	 */
+	include?: string[];
 	tools?: Array<{
 		type: "function";
 		name: string;
 		description?: string;
 		parameters: FunctionParameter;
 	}>;
-	tool_choice?: ToolChoiceType;
+	tool_choice?: ResponsesToolChoice;
 	stream?: boolean;
 	temperature?: number;
 	max_output_tokens?: number;
 	text?: {
-		format:
+		format?:
 			| { type: "text" }
 			| { type: "json_object" }
 			| {
@@ -297,6 +441,7 @@ export interface OpenAIResponsesRequestBody {
 					schema: Record<string, unknown>;
 					strict?: boolean;
 			  };
+		verbosity?: "low" | "medium" | "high";
 	};
 }
 
@@ -318,9 +463,11 @@ export interface AnthropicRequestBody extends BaseRequestBody {
 		| {
 				type: "enabled";
 				budget_tokens: number;
+				display?: "summarized" | "omitted";
 		  }
 		| {
 				type: "adaptive";
+				display?: "summarized" | "omitted";
 		  };
 	output_config?: {
 		effort?: "low" | "medium" | "high" | "xhigh" | "max";
@@ -330,6 +477,13 @@ export interface AnthropicRequestBody extends BaseRequestBody {
 export interface GoogleRequestBody {
 	contents: GoogleMessage[];
 	tools?: GoogleTool[];
+	/**
+	 * Processing tier for the Gemini Developer API (google-ai-studio / glacier).
+	 * "flex" / "priority" select Flex / Priority inference. The served tier is
+	 * returned in the `x-gemini-service-tier` response header.
+	 * Vertex AI uses the `X-Vertex-AI-LLM-Shared-Request-Type` header instead.
+	 */
+	service_tier?: "auto" | "default" | "flex" | "priority";
 	generationConfig?: {
 		temperature?: number;
 		maxOutputTokens?: number;
@@ -364,6 +518,12 @@ export interface ProviderValidationResult {
 	error?: string;
 	statusCode?: number;
 	model?: string;
+	/**
+	 * The probe never got an HTTP response (DNS, connection, TLS or timeout
+	 * failure), so the credential itself was never judged. Callers should word
+	 * this as "could not reach the provider" rather than "key rejected".
+	 */
+	unreachable?: boolean;
 }
 
 // Model with pricing information
@@ -373,9 +533,9 @@ export interface ModelWithPricing {
 		inputPrice?: string;
 		outputPrice?: string;
 		perSecondPrice?: Record<string, string>;
+		perImagePrice?: Record<string, string>;
 		supportedParameters?: string[];
 		externalId: string;
-		discount?: string;
 		region?: string;
 		stability?: string;
 	}>;
@@ -407,7 +567,8 @@ export type RequestBodyPreparer = (
 	response_format?: OpenAIRequestBody["response_format"],
 	tools?: OpenAIToolInput[],
 	tool_choice?: ToolChoiceType,
-	reasoning_effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh",
+	reasoning_effort?:
+		"none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max",
 	supportsReasoning?: boolean,
 	isProd?: boolean,
 	maxImageSizeMB?: number,
@@ -427,6 +588,7 @@ export type RequestBodyPreparer = (
 	useResponsesApi?: boolean,
 	prompt_cache_key?: string,
 	prompt_cache_retention?: PromptCacheRetention,
+	n?: number,
 ) => Promise<ProviderRequestBody | FormData>;
 
 // Type guards
@@ -500,13 +662,14 @@ export function hasMaxTokens(
 export interface WebSearchTool {
 	type: "web_search";
 	/**
-	 * User location for localized search results (OpenAI)
+	 * User location for localized search results (OpenAI and Anthropic)
 	 */
 	user_location?: {
 		type: "approximate";
 		city?: string;
 		region?: string;
 		country?: string;
+		timezone?: string;
 	};
 	/**
 	 * Controls how much context is retrieved from the web (OpenAI)
@@ -519,6 +682,27 @@ export interface WebSearchTool {
 	 * Maximum number of web searches to perform (Anthropic)
 	 */
 	max_uses?: number;
+	/**
+	 * Restrict search results to these domains (Anthropic). Mutually exclusive
+	 * with blocked_domains.
+	 */
+	allowed_domains?: string[];
+	/**
+	 * Exclude these domains from search results (Anthropic). Mutually exclusive
+	 * with allowed_domains.
+	 */
+	blocked_domains?: string[];
+	/**
+	 * Whether the caller demanded a search rather than offering one, i.e. sent
+	 * `tool_choice: {type: "web_search"}`. Not part of the tool the client
+	 * sends: the gateway derives it from `tool_choice` and carries it here so
+	 * every consumer of the extracted tool can see the caller's intent.
+	 *
+	 * Providers whose search is model-elected ignore this — the model already
+	 * decides. It matters for mappings flagged `webSearchForcedOnly`, which are
+	 * only routable when it is set.
+	 */
+	forced?: boolean;
 }
 
 /**

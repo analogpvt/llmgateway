@@ -1,12 +1,6 @@
 "use client";
 
-import {
-	addDays,
-	addHours,
-	differenceInCalendarDays,
-	format,
-	parseISO,
-} from "date-fns";
+import { addDays, differenceInCalendarDays, format, parseISO } from "date-fns";
 import { useSearchParams } from "next/navigation";
 import { useMemo, useState } from "react";
 import {
@@ -20,6 +14,7 @@ import {
 } from "recharts";
 
 import { getDateRangeFromParams } from "@/components/date-range-picker";
+import { useUsageMode } from "@/components/shared/usage-mode-selector";
 import { useDashboardNavigation } from "@/hooks/useDashboardNavigation";
 import {
 	Card,
@@ -36,38 +31,77 @@ import {
 	SelectValue,
 } from "@/lib/components/select";
 import { useApi } from "@/lib/fetch-client";
+import { getBrowserTimeZone } from "@/lib/timezone";
+import { applyUsageModeToDaily } from "@/lib/usage-mode";
 
 import type { TimeRangeValue } from "@/components/time-range-picker";
+import type { GroupBy } from "@/components/usage/group-by";
 import type {
 	ActivitT,
 	ActivityApiKeyUsage,
 	ActivityModelUsage,
+	ActivityUserUsage,
 } from "@/types/activity";
 import type { TooltipProps } from "recharts";
 
-type GroupBy = "model" | "apiKey";
+interface BreakdownSource {
+	modelBreakdown: ActivityModelUsage[];
+	apiKeyBreakdown: ActivityApiKeyUsage[];
+	userBreakdown: ActivityUserUsage[];
+}
 
-// Helper function to get all unique series (model ids or api key ids) from the data
-function getUniqueSeries(
-	data: {
-		modelBreakdown: { id: string }[];
-		apiKeyBreakdown: { id: string }[];
-	}[],
+interface BreakdownItem {
+	id: string;
+	label?: string;
+	requestCount: number;
+	totalTokens: number;
+	cost: number;
+}
+
+// Pick the breakdown for the requested dimension, normalizing each dimension's
+// display field (model id / key description / member name) into `label`.
+function pickBreakdown(
+	day: BreakdownSource,
 	groupBy: GroupBy,
-): string[] {
+): BreakdownItem[] {
+	switch (groupBy) {
+		case "apiKey":
+			return day.apiKeyBreakdown.map((item) => ({
+				...item,
+				label: item.description,
+			}));
+		case "user":
+			return day.userBreakdown.map((item) => ({ ...item, label: item.name }));
+		case "model":
+		default:
+			return day.modelBreakdown;
+	}
+}
+
+const DIMENSION_LABELS: Record<
+	GroupBy,
+	{ noun: string; entity: string; cardTitle: string }
+> = {
+	model: { noun: "model", entity: "Model", cardTitle: "Model Usage Overview" },
+	apiKey: {
+		noun: "API key",
+		entity: "API key",
+		cardTitle: "API Key Usage Overview",
+	},
+	user: { noun: "user", entity: "User", cardTitle: "User Usage Overview" },
+};
+
+// Helper function to get all unique series (model, api key or member ids) from the data
+function getUniqueSeries(data: BreakdownSource[], groupBy: GroupBy): string[] {
 	if (!data || data.length === 0) {
 		return [];
 	}
 
 	const all = new Set<string>();
 	data.forEach((day) => {
-		const items =
-			groupBy === "apiKey" ? day.apiKeyBreakdown : day.modelBreakdown;
-		if (items && items.length > 0) {
-			items.forEach((item) => {
-				all.add(item.id);
-			});
-		}
+		pickBreakdown(day, groupBy).forEach((item) => {
+			all.add(item.id);
+		});
 	});
 
 	return Array.from(all);
@@ -119,12 +153,10 @@ interface TooltipPayload {
 	name: string;
 	value: number;
 	color: string;
-	payload: {
+	payload: BreakdownSource & {
 		requestCount: number;
 		totalTokens: number;
 		cost: number;
-		modelBreakdown: ActivityModelUsage[];
-		apiKeyBreakdown: ActivityApiKeyUsage[];
 	};
 }
 
@@ -147,6 +179,7 @@ const CustomTooltip = ({
 }: CustomTooltipProps) => {
 	if (active && payload && payload.length) {
 		const data = payload[0].payload;
+		const items = pickBreakdown(data, groupBy);
 		return (
 			<div className="rounded-lg border bg-popover text-popover-foreground p-2 shadow-sm">
 				<p className="font-medium">
@@ -169,28 +202,16 @@ const CustomTooltip = ({
 					<span className="font-medium">${data.cost.toFixed(4)}</span> estimated
 					cost
 				</p>
-				{groupBy === "model" &&
-					Array.isArray(data.modelBreakdown) &&
-					data.modelBreakdown.length === 1 && (
-						<p className="mt-1 text-xs text-muted-foreground">
-							Model:{" "}
-							<span className="font-medium">{data.modelBreakdown[0]?.id}</span>
-						</p>
-					)}
-				{groupBy === "apiKey" &&
-					Array.isArray(data.apiKeyBreakdown) &&
-					data.apiKeyBreakdown.length === 1 && (
-						<p className="mt-1 text-xs text-muted-foreground">
-							API key:{" "}
-							<span className="font-medium">
-								{data.apiKeyBreakdown[0]?.description}
-							</span>
-						</p>
-					)}
+				{items.length === 1 && (
+					<p className="mt-1 text-xs text-muted-foreground">
+						{DIMENSION_LABELS[groupBy].entity}:{" "}
+						<span className="font-medium">{items[0].label ?? items[0].id}</span>
+					</p>
+				)}
 				{payload.length > 1 && (
 					<div className="mt-2 pt-2 border-t">
 						<p className="text-sm font-medium">
-							{groupBy === "apiKey" ? "API Key Breakdown:" : "Model Breakdown:"}
+							{DIMENSION_LABELS[groupBy].entity} Breakdown:
 						</p>
 						{payload.map((entry, index) => {
 							// Skip the entry if it's not a model (e.g., it's the total requestCount)
@@ -265,10 +286,12 @@ export function ActivityChart({
 
 	// Build query params based on whether we're using timeRange or date range
 	const queryParams = useMemo(() => {
-		const breakdownParam = groupBy === "apiKey" ? { groupBy } : {};
+		const breakdownParam = groupBy === "model" ? {} : { groupBy };
+		const timezone = getBrowserTimeZone();
 		if (timeRange) {
 			return {
 				timeRange,
+				timezone,
 				...(selectedProject?.id ? { projectId: selectedProject.id } : {}),
 				...(apiKeyId ? { apiKeyId } : {}),
 				...breakdownParam,
@@ -278,13 +301,18 @@ export function ActivityChart({
 		return {
 			from: format(from, "yyyy-MM-dd"),
 			to: format(to, "yyyy-MM-dd"),
+			timezone,
 			...(selectedProject?.id ? { projectId: selectedProject.id } : {}),
 			...(apiKeyId ? { apiKeyId } : {}),
 			...breakdownParam,
 		};
 	}, [timeRange, searchParams, selectedProject?.id, apiKeyId, groupBy]);
 
-	const { data, isLoading, error } = api.useQuery(
+	const {
+		data: rawData,
+		isLoading,
+		error,
+	} = api.useQuery(
 		"get",
 		"/activity",
 		{
@@ -296,6 +324,20 @@ export function ActivityChart({
 			enabled: !!selectedProject?.id,
 			initialData: timeRange ? undefined : initialData,
 		},
+	);
+
+	const usageMode = useUsageMode();
+	const data = useMemo(
+		() =>
+			rawData
+				? {
+						...rawData,
+						activity: rawData.activity.map((day) =>
+							applyUsageModeToDaily(day, usageMode),
+						),
+					}
+				: rawData,
+		[rawData, usageMode],
 	);
 
 	const periodLabel = useMemo(() => {
@@ -314,9 +356,8 @@ export function ActivityChart({
 		return `${days} days`;
 	}, [timeRange, searchParams]);
 
-	const seriesNoun = groupBy === "apiKey" ? "API key" : "model";
-	const cardTitle =
-		groupBy === "apiKey" ? "API Key Usage Overview" : "Model Usage Overview";
+	const seriesNoun = DIMENSION_LABELS[groupBy].noun;
+	const cardTitle = DIMENSION_LABELS[groupBy].cardTitle;
 
 	if (!selectedProject) {
 		return (
@@ -395,30 +436,12 @@ export function ActivityChart({
 		);
 	}
 
-	// Generate the expected time slots (hourly or daily)
+	// Generate the expected time slots (hourly or daily). For timeRange queries
+	// the backend already returns padded, ordered buckets in the requested
+	// timezone, so use them as-is instead of regenerating them locally.
 	const slots: string[] = [];
-	if (hourly && timeRange) {
-		const totalHours = getTimeRangeHours(timeRange);
-		const now = new Date();
-		// Truncate to the current hour
-		const endHour = new Date(
-			now.getFullYear(),
-			now.getMonth(),
-			now.getDate(),
-			now.getHours(),
-		);
-		const startHour = addHours(endHour, -totalHours);
-		for (let i = 0; i < totalHours; i++) {
-			const hour = addHours(startHour, i);
-			slots.push(format(hour, "yyyy-MM-dd'T'HH:mm:ss"));
-		}
-	} else if (timeRange) {
-		const totalDays = getTimeRangeHours(timeRange) / 24;
-		const now = new Date();
-		for (let i = totalDays - 1; i >= 0; i--) {
-			const d = addDays(now, -i);
-			slots.push(format(d, "yyyy-MM-dd"));
-		}
+	if (timeRange) {
+		slots.push(...data.activity.map((item) => item.date));
 	} else {
 		const { from, to } = getDateRangeFromParams(searchParams);
 		const totalDays = differenceInCalendarDays(to, from) + 1;
@@ -439,7 +462,11 @@ export function ActivityChart({
 			// Process breakdown data for stacked bars
 			const result: Record<
 				string,
-				string | number | ActivityModelUsage[] | ActivityApiKeyUsage[]
+				| string
+				| number
+				| ActivityModelUsage[]
+				| ActivityApiKeyUsage[]
+				| ActivityUserUsage[]
 			> = {
 				...dayData,
 				formattedDate: hourly
@@ -448,9 +475,7 @@ export function ActivityChart({
 			};
 
 			// Add each series' selected metric as a separate property for stacking
-			const items =
-				groupBy === "apiKey" ? dayData.apiKeyBreakdown : dayData.modelBreakdown;
-			items.forEach((item) => {
+			pickBreakdown(dayData, groupBy).forEach((item) => {
 				switch (breakdownField) {
 					case "cost":
 						result[item.id] = item.cost;
@@ -479,27 +504,28 @@ export function ActivityChart({
 			cost: 0,
 			modelBreakdown: [],
 			apiKeyBreakdown: [],
+			userBreakdown: [],
 		};
 	});
 
 	const uniqueSeries = getUniqueSeries(data.activity, groupBy);
 	const visibleSeries = showAllModels ? uniqueSeries : uniqueSeries.slice(0, 7);
 
+	// Models are keyed by their own id, so only the labelled dimensions need a
+	// lookup table.
 	const seriesLabelById = new Map<string, string>();
-	if (groupBy === "apiKey") {
-		data.activity.forEach((day) => {
-			day.apiKeyBreakdown.forEach((item) => {
-				if (!seriesLabelById.has(item.id)) {
-					seriesLabelById.set(item.id, item.description || item.id);
-				}
-			});
+	data.activity.forEach((day) => {
+		pickBreakdown(day, groupBy).forEach((item) => {
+			if (item.label && !seriesLabelById.has(item.id)) {
+				seriesLabelById.set(item.id, item.label);
+			}
 		});
-	}
+	});
 	const getSeriesLabel = (id: string) => seriesLabelById.get(id) ?? id;
 
 	return (
 		<Card>
-			<CardHeader className="flex flex-col space-y-4 md:flex-row items-center justify-between pb-2">
+			<CardHeader className="flex flex-col gap-4 space-y-0 md:flex-row md:items-center justify-between pb-2">
 				<div>
 					<CardTitle>{cardTitle}</CardTitle>
 					<CardDescription>
@@ -511,7 +537,7 @@ export function ActivityChart({
 						)}
 					</CardDescription>
 				</div>
-				<div className="flex items-center space-x-2">
+				<div className="flex items-center justify-end space-x-2">
 					<Select
 						value={breakdownField}
 						onValueChange={(value) =>

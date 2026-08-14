@@ -21,20 +21,33 @@ import type {
 	ServerErrorStatusCode,
 } from "hono/utils/http-status";
 
-let _stripe: Stripe | null = null;
+export type StripeMode = "live" | "test";
 
-export function getStripe(): Stripe {
-	if (!_stripe) {
-		if (!process.env.STRIPE_SECRET_KEY) {
+const _stripe: Partial<Record<StripeMode, Stripe>> = {};
+
+/**
+ * Resolve the Stripe client for the given mode. `live` (default) uses
+ * `STRIPE_SECRET_KEY`; `test` uses `STRIPE_SECRET_KEY_TEST` (a Stripe sandbox
+ * secret on the same account), so LLM SDK developers can exercise the full
+ * top-up flow with test cards without a separate staging deployment.
+ */
+export function getStripe(mode: StripeMode = "live"): Stripe {
+	let client = _stripe[mode];
+	if (!client) {
+		const envVar =
+			mode === "test" ? "STRIPE_SECRET_KEY_TEST" : "STRIPE_SECRET_KEY";
+		const secret = process.env[envVar];
+		if (!secret) {
 			throw new Error(
-				"STRIPE_SECRET_KEY environment variable is required for Stripe operations",
+				`${envVar} environment variable is required for Stripe operations`,
 			);
 		}
-		_stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+		client = new Stripe(secret, {
 			apiVersion: "2025-04-30.basil",
 		});
+		_stripe[mode] = client;
 	}
-	return _stripe;
+	return client;
 }
 
 export const payments = new OpenAPIHono<ServerTypes>();
@@ -261,7 +274,15 @@ payments.openapi(createSetupIntent, async (c) => {
 
 	const organizationId = userOrganization.organization.id;
 
+	const stripeCustomerId = await ensureStripeCustomer(organizationId);
+
+	// The customer must be set here so Stripe attaches the payment method
+	// atomically when the client confirms the setup. Without it the PM comes
+	// out of confirmCardSetup "used but unattached", and create-payment-intent
+	// races the setup_intent.succeeded webhook's attach — losing the race
+	// makes Stripe reject the PaymentIntent outright.
 	const setupIntent = await getStripe().setupIntents.create({
+		customer: stripeCustomerId,
 		usage: "off_session",
 		metadata: {
 			organizationId,
@@ -676,9 +697,11 @@ payments.openapi(topUpWithSavedMethod, async (c) => {
 			off_session: true,
 			metadata: {
 				organizationId: userOrganization.organization.id,
+				type: "credit_topup",
 				baseAmount: amount.toString(),
 				platformFee: feeBreakdown.platformFee.toString(),
 				internationalFee: feeBreakdown.internationalFee.toString(),
+				totalAmount: feeBreakdown.totalAmount.toString(),
 				isInternational: isInternational.toString(),
 				userEmail: user.email,
 				userId: user.id,
@@ -726,8 +749,7 @@ payments.openapi(topUpWithSavedMethod, async (c) => {
 
 			throw new HTTPException(
 				(err.statusCode ?? 400) as
-					| ClientErrorStatusCode
-					| ServerErrorStatusCode,
+					ClientErrorStatusCode | ServerErrorStatusCode,
 				{
 					message: err.message,
 				},
@@ -858,11 +880,25 @@ payments.openapi(createCheckoutSession, async (c) => {
 		cancelUrl = `${defaultBillingUrl}?canceled=true`;
 	}
 
-	// IMPORTANT: Metadata is intentionally set on the session only, NOT via
-	// payment_intent_data.metadata. This prevents handlePaymentIntentSucceeded
-	// from also processing this payment (it returns early when baseAmount is
-	// missing from the PaymentIntent metadata). Adding payment_intent_data.metadata
-	// here would cause double-crediting. See handleCreditTopUpCheckout in stripe.ts.
+	// The same metadata goes on the Checkout Session and on its PaymentIntent so
+	// the charge is attributable in the Stripe dashboard (organization, credits,
+	// gross, fees) instead of showing up bare. `source: "stripe_checkout"` marks
+	// the PaymentIntent as owned by the checkout.session.completed webhook:
+	// handlePaymentIntentSucceeded returns early on it, so the top-up is credited
+	// exactly once. See handleCreditTopUpCheckout in stripe.ts.
+	const topUpMetadata = {
+		organizationId,
+		type: "credit_topup",
+		baseAmount: amount.toString(),
+		platformFee: feeBreakdown.platformFee.toString(),
+		// Always 0 here: the checkout page collects the card itself, so the
+		// international-card fee is unknown up front and is not charged on this path.
+		internationalFee: feeBreakdown.internationalFee.toString(),
+		totalAmount: feeBreakdown.totalAmount.toString(),
+		userEmail: user.email,
+		userId: user.id,
+	};
+
 	const session = await getStripe().checkout.sessions.create({
 		customer: stripeCustomerId,
 		mode: "payment",
@@ -881,13 +917,13 @@ payments.openapi(createCheckoutSession, async (c) => {
 		],
 		success_url: successUrl,
 		cancel_url: cancelUrl,
-		metadata: {
-			organizationId,
-			type: "credit_topup",
-			baseAmount: amount.toString(),
-			platformFee: feeBreakdown.platformFee.toString(),
-			userEmail: user.email,
-			userId: user.id,
+		metadata: topUpMetadata,
+		payment_intent_data: {
+			description: `Credit purchase for ${amount} USD (including fees)`,
+			metadata: {
+				...topUpMetadata,
+				source: "stripe_checkout",
+			},
 		},
 	});
 
@@ -933,10 +969,7 @@ const calculateFeesRoute = createRoute({
 						bonusEnabled: z.boolean(),
 						bonusEligible: z.boolean(),
 						bonusIneligibilityReason: z.string().optional(),
-						bonusType: z
-							.enum(["first_purchase", "second_topup", "referral"])
-							.optional(),
-						secondTopupBonusExpiresInDays: z.number().optional(),
+						bonusType: z.enum(["first_purchase", "referral"]).optional(),
 					}),
 				},
 			},
@@ -996,23 +1029,18 @@ payments.openapi(calculateFeesRoute, async (c) => {
 		isInternational,
 	});
 
-	// Calculate bonus for first-time and second top-up credit purchases
+	// Calculate bonus for first-time credit purchases
 	let bonusAmount = 0;
 	let finalCreditAmount = amount;
 	let bonusEligible = false;
 	let bonusIneligibilityReason: string | undefined;
-	let bonusType: "first_purchase" | "second_topup" | "referral" | undefined;
-	let secondTopupBonusExpiresInDays: number | undefined;
+	let bonusType: "first_purchase" | "referral" | undefined;
 
 	const firstBonusMultiplier = process.env.FIRST_TIME_CREDIT_BONUS_MULTIPLIER
 		? parseFloat(process.env.FIRST_TIME_CREDIT_BONUS_MULTIPLIER)
 		: 0;
-	const secondBonusMultiplier = process.env.SECOND_TOPUP_BONUS_MULTIPLIER
-		? parseFloat(process.env.SECOND_TOPUP_BONUS_MULTIPLIER)
-		: 0;
 
 	const firstBonusEnabled = firstBonusMultiplier > 1;
-	const secondBonusEnabled = secondBonusMultiplier > 1;
 
 	// Referral signup bonus applies to the referred org's first top-up and takes
 	// precedence over the env-driven first-time bonus. Mirrors stripe.ts so the
@@ -1023,8 +1051,7 @@ payments.openapi(calculateFeesRoute, async (c) => {
 	);
 	const referralBonusPossible = referralBonusAmount > 0;
 
-	const bonusEnabled =
-		firstBonusEnabled || secondBonusEnabled || referralBonusPossible;
+	const bonusEnabled = firstBonusEnabled || referralBonusPossible;
 
 	if (bonusEnabled) {
 		if (!userOrganization.user || !userOrganization.user.emailVerified) {
@@ -1037,7 +1064,7 @@ payments.openapi(calculateFeesRoute, async (c) => {
 					status: { eq: "completed" },
 				},
 				orderBy: { createdAt: "asc" },
-				limit: 2,
+				limit: 1,
 			});
 
 			if (previousPurchases.length === 0 && referralBonusPossible) {
@@ -1052,35 +1079,7 @@ payments.openapi(calculateFeesRoute, async (c) => {
 				const maxBonus = 50;
 				bonusAmount = Math.min(potentialBonus, maxBonus);
 				finalCreditAmount = amount + bonusAmount;
-			} else if (previousPurchases.length === 1 && secondBonusEnabled) {
-				const secondBonusWindowDays = Number(
-					process.env.SECOND_TOPUP_BONUS_WINDOW_DAYS ?? "30",
-				);
-				const secondBonusMax = Number(
-					process.env.SECOND_TOPUP_BONUS_MAX ?? "25",
-				);
-				const firstPurchaseDate = previousPurchases[0].createdAt;
-				const daysSinceFirst =
-					(Date.now() - firstPurchaseDate.getTime()) / (1000 * 60 * 60 * 24);
-
-				if (daysSinceFirst <= secondBonusWindowDays) {
-					bonusEligible = true;
-					bonusType = "second_topup";
-					const potentialBonus = amount * (secondBonusMultiplier - 1);
-					bonusAmount = Math.min(potentialBonus, secondBonusMax);
-					finalCreditAmount = amount + bonusAmount;
-					secondTopupBonusExpiresInDays = Math.ceil(
-						secondBonusWindowDays - daysSinceFirst,
-					);
-				} else {
-					bonusIneligibilityReason = "second_topup_window_expired";
-				}
-			} else if (previousPurchases.length >= 2) {
-				bonusIneligibilityReason = "already_purchased";
-			} else if (previousPurchases.length === 0 && !firstBonusEnabled) {
-				// No first-purchase bonus configured, but second might be
-				// (user hasn't purchased yet, so no second bonus either)
-			} else {
+			} else if (previousPurchases.length > 0) {
 				bonusIneligibilityReason = "already_purchased";
 			}
 		}
@@ -1095,6 +1094,5 @@ payments.openapi(calculateFeesRoute, async (c) => {
 		bonusEligible,
 		bonusIneligibilityReason,
 		bonusType,
-		secondTopupBonusExpiresInDays,
 	});
 });

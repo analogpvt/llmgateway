@@ -123,6 +123,7 @@ const ChartTooltipContent = ({
 	color,
 	nameKey,
 	labelKey,
+	sortByValue = false,
 }: React.ComponentProps<typeof RechartsPrimitive.Tooltip> &
 	React.ComponentProps<"div"> & {
 		hideLabel?: boolean;
@@ -130,6 +131,7 @@ const ChartTooltipContent = ({
 		indicator?: "line" | "dot" | "dashed";
 		nameKey?: string;
 		labelKey?: string;
+		sortByValue?: boolean;
 	} & { ref?: React.RefObject<HTMLDivElement | null> }) => {
 	const { config } = useChart();
 
@@ -187,6 +189,7 @@ const ChartTooltipContent = ({
 			<div className="grid gap-1.5">
 				{payload
 					.filter((item) => item.type !== "none")
+					.sort((a, b) => (sortByValue ? Number(b.value) - Number(a.value) : 0))
 					.map((item, index) => {
 						const key = `${nameKey ?? item.name ?? item.dataKey ?? "value"}`;
 						const itemConfig = getPayloadConfigFromPayload(config, item, key);
@@ -209,22 +212,20 @@ const ChartTooltipContent = ({
 										) : (
 											!hideIndicator && (
 												<div
-													className={cn(
-														"shrink-0 rounded-[2px] border-[--color-border] bg-[--color-bg]",
-														{
-															"h-2.5 w-2.5": indicator === "dot",
-															"w-1": indicator === "line",
-															"w-0 border-[1.5px] border-dashed bg-transparent":
-																indicator === "dashed",
-															"my-0.5": nestLabel && indicator === "dashed",
-														},
-													)}
-													style={
-														{
-															"--color-bg": indicatorColor,
-															"--color-border": indicatorColor,
-														} as React.CSSProperties
-													}
+													className={cn("shrink-0 rounded-[2px]", {
+														"h-2.5 w-2.5": indicator === "dot",
+														"w-1": indicator === "line",
+														"w-0 border-[1.5px] border-dashed bg-transparent":
+															indicator === "dashed",
+														"my-0.5": nestLabel && indicator === "dashed",
+													})}
+													style={{
+														backgroundColor:
+															indicator === "dashed"
+																? undefined
+																: indicatorColor,
+														borderColor: indicatorColor,
+													}}
 												/>
 											)
 										)}

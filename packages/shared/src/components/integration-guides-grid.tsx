@@ -8,9 +8,13 @@ import {
 	ClineIcon,
 	CodexIcon,
 	ContinueIcon,
+	CrushIcon,
 	CursorIcon,
+	DevPassCodeIcon,
+	GitHubCopilotIcon,
 	HermesIcon,
 	KiloCodeIcon,
+	KimiIcon,
 	N8nIcon,
 	OpenClawIcon,
 	OpenCodeIcon,
@@ -34,6 +38,14 @@ export interface IntegrationGuide {
 
 export const DEFAULT_INTEGRATION_GUIDES: IntegrationGuide[] = [
 	{
+		name: "DevPass Code",
+		description:
+			"Our open-source terminal coding agent built for LLM Gateway. One browser login, every model, no per-provider keys.",
+		href: "/guides/devpass-code",
+		icon: DevPassCodeIcon,
+		comingSoon: false,
+	},
+	{
 		name: "Autohand Code",
 		description:
 			"Use LLM Gateway with Autohand Code for autonomous AI-powered coding in your terminal, IDE, and Slack.",
@@ -52,11 +64,11 @@ export const DEFAULT_INTEGRATION_GUIDES: IntegrationGuide[] = [
 	{
 		name: "Cursor",
 		description:
-			"Use LLM Gateway with Cursor IDE in plan mode only. Cursor's coding agent does not work with external API endpoints.",
+			"Use LLM Gateway with Cursor IDE in plan and agent mode. Tab autocomplete and inline edit stay on Cursor's backend.",
 		href: "https://docs.llmgateway.io/guides/cursor",
 		icon: CursorIcon,
 		comingSoon: false,
-		badge: "Plan mode only",
+		badge: "Plan + Agent mode",
 	},
 	{
 		name: "Codex CLI",
@@ -83,6 +95,23 @@ export const DEFAULT_INTEGRATION_GUIDES: IntegrationGuide[] = [
 		comingSoon: false,
 	},
 	{
+		name: "Crush",
+		description:
+			"Use LLM Gateway with Charm's Crush coding agent for AI-powered terminal coding.",
+		href: "/guides/crush",
+		icon: CrushIcon,
+		comingSoon: false,
+	},
+	{
+		name: "GitHub Copilot app",
+		description:
+			"Use LLM Gateway as a model provider in GitHub's Copilot desktop app for agent sessions with any model.",
+		href: "/guides/github-copilot",
+		icon: GitHubCopilotIcon,
+		comingSoon: false,
+		badge: "BYOK",
+	},
+	{
 		name: "Hermes Agent",
 		description:
 			"Use LLM Gateway with Nous Research's Hermes Agent for terminal-based AI coding.",
@@ -96,6 +125,14 @@ export const DEFAULT_INTEGRATION_GUIDES: IntegrationGuide[] = [
 			"Use LLM Gateway with Kilo Code in VS Code for autonomous AI coding with built-in provider support.",
 		href: "/guides/kilo-code",
 		icon: KiloCodeIcon,
+		comingSoon: false,
+	},
+	{
+		name: "Kimi Code",
+		description:
+			"Use LLM Gateway with Kimi Code CLI for autonomous terminal-based AI coding.",
+		href: "/guides/kimi-code",
+		icon: KimiIcon,
 		comingSoon: false,
 	},
 	{

@@ -50,6 +50,7 @@ import {
 import { cn } from "@/lib/utils";
 
 import {
+	formatPerImagePriceRange,
 	getProviderIcon,
 	providerLogoUrls,
 } from "@llmgateway/shared/components";
@@ -68,9 +69,17 @@ interface ModelSelectorProps {
 	value?: string;
 	onValueChange?: (value: string) => void;
 	placeholder?: string;
-	mode?: "chat" | "video" | "image";
+	// "realtime" only affects presentation; capability filtering is the
+	// caller's responsibility (pass a pre-restricted models array).
+	mode?: "chat" | "video" | "image" | "audio" | "realtime";
 	isOptionDisabled?: (value: string) => boolean;
 	getOptionDisabledReason?: (value: string) => string | undefined;
+	/**
+	 * When true, regional provider mappings are listed as separate selectable
+	 * entries (each labeled with its region) instead of being collapsed into a
+	 * single base entry with a region dropdown. Used by group chat.
+	 */
+	showRegionalVariants?: boolean;
 }
 
 interface FilterState {
@@ -157,7 +166,9 @@ type PriceField =
 	| "cachedInput"
 	| "request"
 	| "imageInput"
-	| "imageOutput";
+	| "imageOutput"
+	| "inputAudio"
+	| "outputAudio";
 
 interface MappingPriceInfo {
 	label: string;
@@ -185,6 +196,10 @@ function getMappingPriceInfo(
 		basePriceStr = mapping.requestPrice;
 	} else if (field === "imageInput") {
 		basePriceStr = mapping.imageInputPrice;
+	} else if (field === "inputAudio") {
+		basePriceStr = mapping.inputAudioPrice;
+	} else if (field === "outputAudio") {
+		basePriceStr = mapping.outputAudioPrice;
 	}
 
 	if (basePriceStr === null || basePriceStr === undefined) {
@@ -226,6 +241,39 @@ function getMappingPriceInfo(
 	return { label: original, original };
 }
 
+function MappingPriceCell({
+	label,
+	mapping,
+	field,
+}: {
+	label: string;
+	mapping: ApiModelProviderMapping | undefined;
+	field: PriceField;
+}) {
+	const price = getMappingPriceInfo(mapping, field);
+	const discounted =
+		price.original && price.discounted && price.original !== price.discounted;
+	return (
+		<div className="space-y-1">
+			<span className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">
+				{label}
+			</span>
+			<p className="text-xs font-mono">
+				{discounted ? (
+					<>
+						<span className="line-through text-muted-foreground">
+							{price.original}
+						</span>{" "}
+						<span className="text-green-500">{price.discounted}</span>
+					</>
+				) : (
+					price.label
+				)}
+			</p>
+		</div>
+	);
+}
+
 interface RootAggregateInfo {
 	minInputPrice?: number;
 	minOutputPrice?: number;
@@ -233,6 +281,7 @@ interface RootAggregateInfo {
 	minRequestPrice?: number;
 	minImageInputPrice?: number;
 	minImageOutputPrice?: number;
+	minPerImagePrice?: number;
 	maxContextSize?: number;
 	maxOutput?: number;
 	capabilities: string[];
@@ -247,6 +296,7 @@ function getRootAggregateInfo(model: ApiModel): RootAggregateInfo {
 	let minRequestPrice: number | undefined;
 	let minImageInputPrice: number | undefined;
 	let minImageOutputPrice: number | undefined;
+	let minPerImagePrice: number | undefined;
 	let maxContextSize: number | undefined;
 	let maxOutput: number | undefined;
 	const capabilitySet = new Set<string>();
@@ -332,6 +382,19 @@ function getRootAggregateInfo(model: ApiModel): RootAggregateInfo {
 			minImageInputPrice = effectiveImageInput;
 		}
 
+		if (mapping.perImagePrice) {
+			for (const tier of Object.values(mapping.perImagePrice)) {
+				const effectiveTier = applyDiscount(tier, mapping.discount);
+				if (
+					effectiveTier !== undefined &&
+					effectiveTier > 0 &&
+					(minPerImagePrice === undefined || effectiveTier < minPerImagePrice)
+				) {
+					minPerImagePrice = effectiveTier;
+				}
+			}
+		}
+
 		if (
 			mapping.contextSize !== null &&
 			mapping.contextSize !== undefined &&
@@ -365,6 +428,7 @@ function getRootAggregateInfo(model: ApiModel): RootAggregateInfo {
 		minRequestPrice,
 		minImageInputPrice,
 		minImageOutputPrice,
+		minPerImagePrice,
 		maxContextSize,
 		maxOutput,
 		capabilities: Array.from(capabilitySet),
@@ -397,6 +461,20 @@ function estimateImageCost(
 	}
 	const request = mapping.requestPrice ? parseFloat(mapping.requestPrice) : 0;
 	const discount = mapping.discount ? parseFloat(mapping.discount) : 0;
+	// Flat per-image pricing: estimate on the typical 1K tier.
+	if (mapping.perImagePrice) {
+		const tier =
+			mapping.perImagePrice["1K"] ??
+			mapping.perImagePrice["default"] ??
+			Object.values(mapping.perImagePrice)[0];
+		const base = tier !== undefined ? parseFloat(tier) : NaN;
+		if (Number.isFinite(base) && base > 0) {
+			return {
+				base,
+				discounted: discount > 0 ? base * (1 - discount) : base,
+			};
+		}
+	}
 	const imageOut = mapping.imageOutputPrice
 		? parseFloat(mapping.imageOutputPrice)
 		: 0;
@@ -634,7 +712,7 @@ function ModelEntryRowComponent({
 									)}
 								</div>
 								<span className="text-xs text-muted-foreground truncate">
-									{disabledReason ?? "Auto-select provider"}
+									Auto-select provider
 								</span>
 							</div>
 						</div>
@@ -800,6 +878,7 @@ export function ModelSelector({
 	mode = "chat",
 	isOptionDisabled,
 	getOptionDisabledReason,
+	showRegionalVariants = false,
 }: ModelSelectorProps) {
 	const { isFavorite, toggleFavorite } = useFavoriteModels();
 	const isMobile = useIsMobile();
@@ -948,6 +1027,16 @@ export function ModelSelector({
 				continue;
 			}
 
+			// Hide fully deactivated models: if every provider mapping is
+			// deactivated there's nothing left to route to, so skip the model
+			// (including its root "auto-select" entry) entirely.
+			const hasActiveMapping = m.mappings.some(
+				(mp) => !(mp.deactivatedAt && new Date(mp.deactivatedAt) <= now),
+			);
+			if (!hasActiveMapping) {
+				continue;
+			}
+
 			// Add root model entry (auto-routing)
 			const aliasText = m.aliases?.join(" ") ?? "";
 			const rootSearchText = normalize(
@@ -960,6 +1049,9 @@ export function ModelSelector({
 			});
 
 			for (const mp of m.mappings) {
+				if (mp.region && !showRegionalVariants) {
+					continue;
+				}
 				const isDeactivated =
 					mp.deactivatedAt && new Date(mp.deactivatedAt) <= now;
 				if (!isDeactivated) {
@@ -984,7 +1076,7 @@ export function ModelSelector({
 			}
 		}
 		return out;
-	}, [models, providers]);
+	}, [models, providers, showRegionalVariants]);
 
 	// Defer search input value to keep typing responsive with large lists
 	const deferredSearch = React.useDeferredValue(searchQuery);
@@ -1030,8 +1122,15 @@ export function ModelSelector({
 			});
 		}
 		if (deferredSearch) {
-			const q = normalize(deferredSearch);
-			list = list.filter((entry) => entry.searchText.includes(q));
+			const tokens = deferredSearch
+				.toLowerCase()
+				.split(/[-_\s]+/)
+				.filter(Boolean);
+			if (tokens.length > 0) {
+				list = list.filter((entry) =>
+					tokens.every((t) => entry.searchText.includes(t)),
+				);
+			}
 		}
 		if (filters.providers.length > 0) {
 			list = list.filter(
@@ -1096,6 +1195,20 @@ export function ModelSelector({
 				}
 				return e.mapping ? providersWithKeys.has(e.mapping.providerId) : false;
 			});
+		}
+		if (deferredSearch) {
+			const tokens = deferredSearch
+				.toLowerCase()
+				.split(/[-_\s]+/)
+				.filter(Boolean);
+			if (tokens.length > 0) {
+				list = [...list].sort((a, b) => {
+					if (a.isRoot === b.isRoot) {
+						return 0;
+					}
+					return a.isRoot ? -1 : 1;
+				});
+			}
 		}
 		return list;
 	}, [allEntries, deferredSearch, filters, isFavorite, providersWithKeys]);
@@ -1698,7 +1811,9 @@ export function ModelSelector({
 														previewEntry.model,
 													);
 
-													const isVideo = mode === "video";
+													const isVideo =
+														mode === "video" ||
+														!!previewEntry.model.output?.includes("video");
 													const minPerSec = isVideo
 														? getMinPerSecondPrice(previewEntry.model.mappings)
 														: null;
@@ -1718,7 +1833,8 @@ export function ModelSelector({
 														((aggregate.minRequestPrice !== undefined &&
 															aggregate.minRequestPrice > 0) ||
 															aggregate.minImageInputPrice !== undefined ||
-															aggregate.minImageOutputPrice !== undefined);
+															aggregate.minImageOutputPrice !== undefined ||
+															aggregate.minPerImagePrice !== undefined);
 
 													const imageEstimate =
 														mode === "image"
@@ -1771,6 +1887,15 @@ export function ModelSelector({
 																				</p>
 																			</div>
 																		</div>
+																		{mode === "chat" && (
+																			<div className="flex items-start gap-1.5 rounded-md bg-muted/50 px-2.5 py-2 text-xs text-muted-foreground">
+																				<Info className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+																				<span>
+																					Selecting this model will open Video
+																					Studio.
+																				</span>
+																			</div>
+																		)}
 																	</div>
 																) : (
 																	<div className="space-y-2">
@@ -1852,6 +1977,23 @@ export function ModelSelector({
 															{hasImagePricing && (
 																<div className="pt-2">
 																	<div className="grid grid-cols-2 gap-3">
+																		{aggregate.minPerImagePrice !==
+																			undefined && (
+																			<div className="space-y-1">
+																				<span className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">
+																					Per Image
+																				</span>
+																				<p className="text-xs font-mono">
+																					$
+																					{parseFloat(
+																						aggregate.minPerImagePrice.toFixed(
+																							4,
+																						),
+																					)}
+																					/image
+																				</p>
+																			</div>
+																		)}
 																		{aggregate.minRequestPrice !== undefined &&
 																			aggregate.minRequestPrice > 0 && (
 																				<div className="space-y-1">
@@ -1937,25 +2079,37 @@ export function ModelSelector({
 
 												<div className="space-y-2">
 													<h5 className="font-medium text-xs">
-														{mode === "video"
+														{mode === "video" ||
+														previewEntry.model.output?.includes("video")
 															? "Video Pricing"
 															: "Pricing & Limits"}
 													</h5>
-													{mode === "video" ? (
-														<div className="grid grid-cols-1 gap-3">
-															<div className="space-y-1">
-																<span className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">
-																	Per Second
-																</span>
-																<p className="text-xs font-mono">
-																	{previewEntry.mapping?.perSecondPrice
-																		? formatPerSecondPrice(
-																				previewEntry.mapping.perSecondPrice,
-																			)
-																		: "Unknown"}
-																</p>
+													{mode === "video" ||
+													previewEntry.model.output?.includes("video") ? (
+														<>
+															<div className="grid grid-cols-1 gap-3">
+																<div className="space-y-1">
+																	<span className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">
+																		Per Second
+																	</span>
+																	<p className="text-xs font-mono">
+																		{previewEntry.mapping?.perSecondPrice
+																			? formatPerSecondPrice(
+																					previewEntry.mapping.perSecondPrice,
+																				)
+																			: "Unknown"}
+																	</p>
+																</div>
 															</div>
-														</div>
+															{mode === "chat" && (
+																<div className="flex items-start gap-1.5 rounded-md bg-muted/50 px-2.5 py-2 text-xs text-muted-foreground">
+																	<Info className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+																	<span>
+																		Selecting this model will open Video Studio.
+																	</span>
+																</div>
+															)}
+														</>
 													) : (
 														<>
 															<div className="grid grid-cols-2 gap-3">
@@ -1964,7 +2118,9 @@ export function ModelSelector({
 																	<>
 																		<div className="space-y-1">
 																			<span className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">
-																				Input
+																				{mode === "realtime"
+																					? "Text In"
+																					: "Input"}
 																			</span>
 																			<p className="text-xs font-mono">
 																				{(() => {
@@ -2022,6 +2178,20 @@ export function ModelSelector({
 																				})()}
 																			</p>
 																		</div>
+																	</>
+																)}
+																{mode === "realtime" && (
+																	<>
+																		<MappingPriceCell
+																			label="Audio In"
+																			mapping={previewEntry.mapping}
+																			field="inputAudio"
+																		/>
+																		<MappingPriceCell
+																			label="Audio Out"
+																			mapping={previewEntry.mapping}
+																			field="outputAudio"
+																		/>
 																	</>
 																)}
 																<div className="space-y-1">
@@ -2119,9 +2289,33 @@ export function ModelSelector({
 														})()}
 													{/* Image Generation Pricing */}
 													{(previewEntry.mapping?.requestPrice ??
+														previewEntry.mapping?.perImagePrice ??
 														previewEntry.mapping?.imageInputPrice) && (
 														<div className="pt-2">
 															<div className="grid grid-cols-2 gap-3">
+																{previewEntry.mapping?.perImagePrice &&
+																	Object.keys(
+																		previewEntry.mapping.perImagePrice,
+																	).length > 0 && (
+																		<div className="space-y-1">
+																			<span className="text-[11px] font-medium text-muted-foreground uppercase tracking-wide">
+																				Per Image
+																			</span>
+																			<p className="text-xs font-mono">
+																				{(() => {
+																					const range =
+																						formatPerImagePriceRange(
+																							previewEntry.mapping
+																								.perImagePrice,
+																							previewEntry.mapping.discount,
+																						);
+																					return range
+																						? `${range}/image`
+																						: "Unknown";
+																				})()}
+																			</p>
+																		</div>
+																	)}
 																{previewEntry.mapping?.requestPrice &&
 																	parseFloat(
 																		previewEntry.mapping.requestPrice,
@@ -2220,6 +2414,36 @@ export function ModelSelector({
 																		</Badge>
 																	);
 																})}
+															</div>
+														</div>
+													) : null;
+												})()}
+												{(() => {
+													if (!previewEntry.mapping) {
+														return null;
+													}
+													const regions = previewEntry.model.mappings
+														.filter(
+															(m) =>
+																m.providerId ===
+																	previewEntry.mapping!.providerId && m.region,
+														)
+														.map((m) => m.region as string);
+													return regions.length > 0 ? (
+														<div className="space-y-1">
+															<h5 className="font-medium text-xs">
+																Available Regions
+															</h5>
+															<div className="flex flex-wrap gap-1">
+																{regions.map((r) => (
+																	<Badge
+																		key={r}
+																		variant="secondary"
+																		className="text-[10px] px-1.5 py-0.5"
+																	>
+																		{r}
+																	</Badge>
+																))}
 															</div>
 														</div>
 													) : null;
@@ -2327,7 +2551,8 @@ export function ModelSelector({
 												(aggregate.minRequestPrice !== undefined &&
 													aggregate.minRequestPrice > 0) ||
 												aggregate.minImageInputPrice !== undefined ||
-												aggregate.minImageOutputPrice !== undefined;
+												aggregate.minImageOutputPrice !== undefined ||
+												aggregate.minPerImagePrice !== undefined;
 
 											const hasCapabilities = aggregate.capabilities.length > 0;
 
@@ -2419,6 +2644,20 @@ export function ModelSelector({
 													{hasImagePricing && (
 														<div className="pt-2">
 															<div className="grid grid-cols-2 gap-3">
+																{aggregate.minPerImagePrice !== undefined && (
+																	<div className="space-y-1">
+																		<span className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+																			Per Image
+																		</span>
+																		<p className="text-sm font-mono">
+																			$
+																			{parseFloat(
+																				aggregate.minPerImagePrice.toFixed(4),
+																			)}
+																			/image
+																		</p>
+																	</div>
+																)}
 																{aggregate.minRequestPrice !== undefined &&
 																	aggregate.minRequestPrice > 0 && (
 																		<div className="space-y-1">
@@ -2638,12 +2877,33 @@ export function ModelSelector({
 												)}
 											{/* Image Generation Pricing */}
 											{(selectedDetails.mapping?.requestPrice ??
+												selectedDetails.mapping?.perImagePrice ??
 												selectedDetails.mapping?.imageInputPrice) && (
 												<div className="pt-2 border-t border-dashed">
 													<span className="text-xs font-medium text-muted-foreground uppercase tracking-wide block mb-2">
 														Image Pricing
 													</span>
 													<div className="grid grid-cols-2 gap-3">
+														{selectedDetails.mapping?.perImagePrice &&
+															Object.keys(selectedDetails.mapping.perImagePrice)
+																.length > 0 && (
+																<div className="space-y-1">
+																	<span className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+																		Per Image
+																	</span>
+																	<p className="text-sm font-mono">
+																		{(() => {
+																			const range = formatPerImagePriceRange(
+																				selectedDetails.mapping.perImagePrice,
+																				selectedDetails.mapping.discount,
+																			);
+																			return range
+																				? `${range}/image`
+																				: "Unknown";
+																		})()}
+																	</p>
+																</div>
+															)}
 														{selectedDetails.mapping?.requestPrice &&
 															parseFloat(selectedDetails.mapping.requestPrice) >
 																0 && (
@@ -2741,6 +3001,36 @@ export function ModelSelector({
 																</Badge>
 															);
 														})}
+													</div>
+												</div>
+											) : null;
+										})()}
+										{(() => {
+											if (!selectedDetails.mapping) {
+												return null;
+											}
+											const regions = selectedDetails.model.mappings
+												.filter(
+													(m) =>
+														m.providerId ===
+															selectedDetails.mapping!.providerId && m.region,
+												)
+												.map((m) => m.region as string);
+											return regions.length > 0 ? (
+												<div className="space-y-2">
+													<h5 className="font-medium text-sm">
+														Available Regions
+													</h5>
+													<div className="flex flex-wrap gap-1.5">
+														{regions.map((r) => (
+															<Badge
+																key={r}
+																variant="secondary"
+																className="text-xs px-2 py-1"
+															>
+																{r}
+															</Badge>
+														))}
 													</div>
 												</div>
 											) : null;

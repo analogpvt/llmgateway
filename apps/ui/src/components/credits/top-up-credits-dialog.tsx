@@ -8,7 +8,15 @@ import {
 } from "@stripe/react-stripe-js";
 import { keepPreviousData, useQueryClient } from "@tanstack/react-query";
 import confetti from "canvas-confetti";
-import { ChevronDown, CreditCard, Lock, Plus } from "lucide-react";
+import {
+	ChevronDown,
+	Coins,
+	CreditCard,
+	Lock,
+	Pencil,
+	Plus,
+} from "lucide-react";
+import Link from "next/link";
 import { usePostHog } from "posthog-js/react";
 import { useEffect, useState } from "react";
 
@@ -259,12 +267,6 @@ function AmountStep({
 
 	const hasBonus = feeData?.bonusAmount && feeData.bonusAmount > 0;
 
-	useEffect(() => {
-		if (feeData?.bonusType === "second_topup" && feeData.bonusEligible) {
-			posthog.capture("second_topup_bonus_eligible_viewed");
-		}
-	}, [feeData?.bonusType, feeData?.bonusEligible, posthog]);
-
 	const handleStripeCheckout = async () => {
 		posthog.capture("topup_stripe_checkout_started", { amount });
 		setCheckoutLoading(true);
@@ -299,30 +301,22 @@ function AmountStep({
 				</DialogDescription>
 			</DialogHeader>
 			<div className="space-y-5 py-2">
-				{feeData?.bonusType === "second_topup" &&
-					feeData.secondTopupBonusExpiresInDays !== undefined && (
-						<div className="rounded-lg border border-green-200 bg-green-50 p-3 dark:border-green-800 dark:bg-green-950/30">
-							<p className="text-sm font-medium text-green-800 dark:text-green-200">
-								Get +
-								{Math.round(
-									((feeData.bonusAmount ?? 0) / (feeData.baseAmount || 1)) *
-										100,
-								)}
-								% bonus on this top-up — expires in{" "}
-								{feeData.secondTopupBonusExpiresInDays} day
-								{feeData.secondTopupBonusExpiresInDays !== 1 ? "s" : ""}
-							</p>
-						</div>
-					)}
-
 				{/* Hero amount input */}
 				<div className="flex flex-col items-center gap-1.5 pt-1">
-					<Label htmlFor="amount" className="sr-only">
-						Amount in USD
+					<Label
+						htmlFor="amount"
+						className="text-xs font-medium uppercase tracking-wider text-muted-foreground"
+					>
+						Enter amount
 					</Label>
 					<label
 						htmlFor="amount"
-						className="flex cursor-text items-baseline justify-center"
+						className={cn(
+							"flex w-full max-w-[280px] cursor-text items-center justify-center gap-1 rounded-xl border-2 bg-background px-4 py-2 transition-colors focus-within:border-primary focus-within:ring-4 focus-within:ring-ring/20",
+							amountValidationMessage
+								? "border-destructive focus-within:border-destructive focus-within:ring-destructive/20"
+								: "border-input hover:border-muted-foreground/50",
+						)}
 					>
 						<span className="text-3xl font-light text-muted-foreground">$</span>
 						<input
@@ -332,23 +326,37 @@ function AmountStep({
 							pattern="[0-9]*"
 							autoComplete="off"
 							maxLength={4}
+							placeholder="0"
 							value={amount || ""}
+							onFocus={(e) => e.target.select()}
 							onChange={(e) => {
 								const digits = e.target.value
 									.replace(/[^0-9]/g, "")
 									.slice(0, 4);
 								setAmount(digits === "" ? 0 : Number(digits));
 							}}
-							className="ml-1 w-[4ch] border-0 bg-transparent p-0 text-left text-5xl font-bold tabular-nums tracking-tight caret-primary focus:outline-none focus:ring-0"
+							className="w-[4ch] border-0 bg-transparent p-0 text-center text-5xl font-bold tabular-nums tracking-tight caret-primary placeholder:text-muted-foreground/40 focus:outline-none focus:ring-0"
 							aria-invalid={Boolean(amountValidationMessage)}
+							aria-describedby="amount-hint"
 							required
 						/>
+						<Pencil
+							className="h-4 w-4 shrink-0 text-muted-foreground"
+							aria-hidden="true"
+						/>
 					</label>
-					{amountValidationMessage ? (
-						<p className="text-xs text-destructive">
-							{amountValidationMessage}
-						</p>
-					) : null}
+					<p
+						id="amount-hint"
+						className={cn(
+							"text-xs",
+							amountValidationMessage
+								? "text-destructive"
+								: "text-muted-foreground",
+						)}
+					>
+						{amountValidationMessage ??
+							`Type any amount from $${CREDIT_TOP_UP_MIN_AMOUNT} to $${CREDIT_TOP_UP_MAX_AMOUNT.toLocaleString("en-US")}`}
+					</p>
 				</div>
 
 				{/* Preset grid */}
@@ -448,11 +456,9 @@ function AmountStep({
 									<div className="-mx-2 flex justify-between rounded bg-green-50 px-2 py-1 font-semibold text-green-600 dark:bg-green-950/50 dark:text-green-400">
 										<span>
 											🎉{" "}
-											{feeData.bonusType === "second_topup"
-												? "Second top-up bonus"
-												: feeData.bonusType === "referral"
-													? "Referral bonus"
-													: "First-time bonus"}
+											{feeData.bonusType === "referral"
+												? "Referral bonus"
+												: "First-time bonus"}
 										</span>
 										<span className="tabular-nums">
 											+${feeData.bonusAmount.toFixed(2)}
@@ -499,6 +505,38 @@ function AmountStep({
 							: "Add credits"}
 				</Button>
 
+				<div className="relative flex items-center justify-center">
+					<span
+						aria-hidden="true"
+						className="absolute inset-x-0 top-1/2 h-px -translate-y-1/2 bg-border"
+					/>
+					<span className="relative bg-background px-2 text-xs font-medium text-muted-foreground">
+						or check out with
+					</span>
+				</div>
+
+				<button
+					type="button"
+					onClick={handleStripeCheckout}
+					disabled={isActionDisabled}
+					aria-label="Pay with Apple Pay, Google Pay, crypto, or another method"
+					className="flex w-full items-center justify-center gap-2.5 rounded-lg border px-4 py-2.5 transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60"
+				>
+					{checkoutLoading ? (
+						<span className="inline-flex items-center gap-2 text-sm text-muted-foreground">
+							<Spinner className="h-4 w-4 animate-spin" />
+							Redirecting…
+						</span>
+					) : (
+						<>
+							<ApplePayMark />
+							<GooglePayMark />
+							<CryptoMark />
+							<span className="text-xs text-muted-foreground">&amp; more</span>
+						</>
+					)}
+				</button>
+
 				<div className="flex flex-wrap items-center justify-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
 					<span className="inline-flex items-center gap-1">
 						<Lock className="h-3 w-3" />
@@ -508,16 +546,7 @@ function AmountStep({
 					<span>Visa · Mastercard · Amex</span>
 				</div>
 
-				<button
-					type="button"
-					onClick={handleStripeCheckout}
-					disabled={isActionDisabled}
-					className="text-center text-xs text-muted-foreground underline-offset-4 hover:text-foreground hover:underline disabled:cursor-not-allowed disabled:opacity-60"
-				>
-					{checkoutLoading
-						? "Redirecting…"
-						: "Use Apple Pay, Google Pay, or another method →"}
-				</button>
+				<InvoiceSettingsNote organizationId={organizationId} />
 			</DialogFooter>
 		</>
 	);
@@ -753,6 +782,7 @@ function PaymentStep({
 						{loading ? "Processing..." : `Continue`}
 					</Button>
 				</DialogFooter>
+				<InvoiceSettingsNote organizationId={organizationId} />
 			</form>
 		</>
 	);
@@ -1161,11 +1191,9 @@ function ConfirmPaymentStep({
 								<div className="flex justify-between text-green-600 font-semibold bg-green-50 dark:bg-green-950/50 -mx-2 px-2 py-1 rounded">
 									<span>
 										🎉{" "}
-										{feeData.bonusType === "second_topup"
-											? "Second top-up bonus"
-											: feeData.bonusType === "referral"
-												? "Referral bonus"
-												: "First-time bonus"}
+										{feeData.bonusType === "referral"
+											? "Referral bonus"
+											: "First-time bonus"}
 									</span>
 									<span>+${feeData.bonusAmount.toFixed(2)}</span>
 								</div>
@@ -1198,7 +1226,82 @@ function ConfirmPaymentStep({
 							: `Pay ${feeData ? `$${feeData.totalAmount.toFixed(2)}` : `$${amount}`}`}
 					</Button>
 				</DialogFooter>
+				<InvoiceSettingsNote organizationId={organizationId} />
 			</form>
 		</>
+	);
+}
+
+function InvoiceSettingsNote({
+	organizationId,
+}: {
+	organizationId: string | undefined;
+}) {
+	return (
+		<p className="text-center text-[11px] leading-relaxed text-muted-foreground">
+			Need company/address details on your invoice?{" "}
+			{organizationId ? (
+				<Link
+					href={`/dashboard/${organizationId}/org/preferences`}
+					className="font-medium underline underline-offset-2 hover:text-foreground"
+				>
+					Update billing settings
+				</Link>
+			) : (
+				"Update billing settings"
+			)}{" "}
+			before purchase. We email the invoice automatically after payment.
+		</p>
+	);
+}
+
+function ApplePayMark() {
+	return (
+		<span className="inline-flex items-center gap-1 rounded-md bg-foreground px-2 py-1 text-background">
+			<svg
+				viewBox="0 0 24 24"
+				className="h-3.5 w-3.5"
+				fill="currentColor"
+				aria-hidden="true"
+			>
+				<path d="M17.05 20.28c-.98.95-2.05.8-3.08.35-1.09-.46-2.09-.48-3.24 0-1.44.62-2.2.44-3.06-.35C2.79 15.25 3.51 7.59 9.05 7.31c1.35.07 2.29.74 3.08.8 1.18-.24 2.31-.93 3.57-.84 1.51.12 2.65.72 3.4 1.8-3.12 1.87-2.38 5.98.48 7.13-.57 1.5-1.31 2.99-2.54 4.09l.01-.01zM12.03 7.25c-.15-2.23 1.66-4.07 3.74-4.25.29 2.58-2.34 4.5-3.74 4.25z" />
+			</svg>
+			<span className="text-xs font-semibold">Pay</span>
+		</span>
+	);
+}
+
+function GooglePayMark() {
+	return (
+		<span className="inline-flex items-center gap-1 rounded-md border bg-white px-2 py-1">
+			<svg viewBox="0 0 48 48" className="h-3.5 w-3.5" aria-hidden="true">
+				<path
+					fill="#EA4335"
+					d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"
+				/>
+				<path
+					fill="#4285F4"
+					d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"
+				/>
+				<path
+					fill="#FBBC05"
+					d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"
+				/>
+				<path
+					fill="#34A853"
+					d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"
+				/>
+			</svg>
+			<span className="text-xs font-semibold text-[#5f6368]">Pay</span>
+		</span>
+	);
+}
+
+function CryptoMark() {
+	return (
+		<span className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1">
+			<Coins className="h-3.5 w-3.5 text-amber-500" aria-hidden="true" />
+			<span className="text-xs font-semibold">Crypto</span>
+		</span>
 	);
 }

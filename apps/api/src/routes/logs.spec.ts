@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { app } from "@/index.js";
 import { createTestUser, deleteAll } from "@/testing.js";
 
-import { db, tables } from "@llmgateway/db";
+import { db, eq, tables } from "@llmgateway/db";
 
 describe("logs route", () => {
 	let token: string;
@@ -250,6 +250,68 @@ describe("logs route", () => {
 			expect(json.pagination.limit).toBe(50);
 		});
 
+		test("should filter logs by usedMode", async () => {
+			await db.insert(tables.log).values({
+				id: "test-log-credits",
+				requestId: "test-log-credits",
+				organizationId: "test-org-id",
+				projectId: "test-project-id",
+				apiKeyId: "test-api-key-id",
+				duration: 100,
+				requestedModel: "gpt-4",
+				requestedProvider: "openai",
+				usedModel: "gpt-4",
+				usedProvider: "openai",
+				responseSize: 500,
+				promptTokens: "5",
+				completionTokens: "5",
+				totalTokens: "10",
+				messages: JSON.stringify([{ role: "user", content: "credits" }]),
+				mode: "hybrid",
+				usedMode: "credits",
+			});
+
+			const creditsRes = await app.request(
+				"/logs?" +
+					new URLSearchParams({
+						projectId: "test-project-id",
+						usedMode: "credits",
+					}),
+				{ headers: { Cookie: token } },
+			);
+			expect(creditsRes.status).toBe(200);
+			const creditsJson = await creditsRes.json();
+			expect(creditsJson.logs.length).toBe(1);
+			expect(creditsJson.logs[0].id).toBe("test-log-credits");
+			expect(creditsJson.logs[0].usedMode).toBe("credits");
+
+			const byokRes = await app.request(
+				"/logs?" +
+					new URLSearchParams({
+						projectId: "test-project-id",
+						usedMode: "api-keys",
+					}),
+				{ headers: { Cookie: token } },
+			);
+			expect(byokRes.status).toBe(200);
+			const byokJson = await byokRes.json();
+			expect(byokJson.logs.length).toBe(1);
+			expect(byokJson.logs[0].id).toBe("test-log-id-1");
+
+			// "all" behaves like no filter.
+			const allRes = await app.request(
+				"/logs?" +
+					new URLSearchParams({
+						projectId: "test-project-id",
+						usedMode: "all",
+					}),
+				{ headers: { Cookie: token } },
+			);
+			expect(allRes.status).toBe(200);
+			const allJson = await allRes.json();
+			expect(allJson.logs.length).toBe(2);
+		});
+
 		test("should filter by second projectId", async () => {
 			const params = new URLSearchParams({ projectId: "test-project-id-2" });
 			const res = await app.request("/logs?" + params, {
@@ -267,6 +329,50 @@ describe("logs route", () => {
 			expect(json.pagination.hasMore).toBe(false);
 			expect(json.pagination.nextCursor).toBeNull();
 			expect(json.pagination.limit).toBe(50);
+		});
+
+		test("should filter logs by model with a region-suffixed usedModel", async () => {
+			// usedModel is stored as `provider/modelId[:region]`. The model filter
+			// receives the bare model id, so the region suffix must be stripped.
+			await db.insert(tables.log).values({
+				id: "test-log-id-region",
+				requestId: "test-log-id-region",
+				organizationId: "test-org-id",
+				projectId: "test-project-id",
+				apiKeyId: "test-api-key-id",
+				duration: 100,
+				requestedModel: "claude-opus-4-6",
+				requestedProvider: "aws-bedrock",
+				usedModel: "aws-bedrock/claude-opus-4-6:global",
+				usedProvider: "aws-bedrock",
+				responseSize: 1000,
+				content: "Test response with region-suffixed model",
+				finishReason: "stop",
+				promptTokens: "10",
+				completionTokens: "20",
+				totalTokens: "30",
+				temperature: 0.7,
+				maxTokens: 100,
+				messages: JSON.stringify([{ role: "user", content: "Hello region" }]),
+				mode: "api-keys",
+				usedMode: "api-keys",
+			});
+
+			const params = new URLSearchParams({
+				projectId: "test-project-id",
+				model: "claude-opus-4-6",
+			});
+			const res = await app.request("/logs?" + params, {
+				method: "GET",
+				headers: {
+					Cookie: token,
+				},
+			});
+
+			expect(res.status).toBe(200);
+			const json = await res.json();
+			expect(json.logs.length).toBe(1);
+			expect(json.logs[0].id).toBe("test-log-id-region");
 		});
 
 		test("should filter logs by custom header", async () => {
@@ -547,6 +653,283 @@ describe("logs route", () => {
 				secondPageIds.has(id),
 			);
 			expect(intersection.length).toBe(0);
+		});
+	});
+
+	// internalErrorDetails stores the raw upstream error for stealth providers
+	// and must never be returned by any public log endpoint, regardless of what
+	// the UI chooses to display.
+	describe("internal error details are never exposed", () => {
+		const SECRET = "SecretVendor";
+
+		beforeEach(async () => {
+			await db.insert(tables.log).values({
+				id: "stealth-error-log-id",
+				requestId: "stealth-error-log-id",
+				organizationId: "test-org-id",
+				projectId: "test-project-id",
+				apiKeyId: "test-api-key-id",
+				duration: 100,
+				requestedModel: "glm-5.2",
+				requestedProvider: "granite",
+				usedModel: "glm-5.2",
+				usedProvider: "granite",
+				responseSize: 0,
+				finishReason: "upstream_error",
+				unifiedFinishReason: "upstream_error",
+				hasError: true,
+				errorDetails: {
+					statusCode: 500,
+					statusText: "Internal Server Error",
+					responseText: "Upstream provider error (500 Internal Server Error)",
+				},
+				internalErrorDetails: {
+					statusCode: 500,
+					statusText: `${SECRET} exploded`,
+					responseText: `{"error":{"message":"${SECRET} quota exceeded on api.secretvendor.com"}}`,
+				},
+				messages: JSON.stringify([{ role: "user", content: "Hello" }]),
+				mode: "credits",
+				usedMode: "credits",
+			});
+		});
+
+		test("list endpoint omits internalErrorDetails and its content", async () => {
+			const params = new URLSearchParams({ projectId: "test-project-id" });
+			const res = await app.request("/logs?" + params, {
+				method: "GET",
+				headers: {
+					Cookie: token,
+				},
+			});
+
+			expect(res.status).toBe(200);
+			const text = await res.text();
+			expect(text).not.toContain("internalErrorDetails");
+			expect(text).not.toContain(SECRET);
+			expect(text).not.toContain("secretvendor.com");
+
+			const json = JSON.parse(text);
+			const log = json.logs.find(
+				(entry: { id: string }) => entry.id === "stealth-error-log-id",
+			);
+			expect(log).toBeTruthy();
+			expect("internalErrorDetails" in log).toBe(false);
+			// The redacted public error details are still served.
+			expect(log.errorDetails).toEqual({
+				statusCode: 500,
+				statusText: "Internal Server Error",
+				responseText: "Upstream provider error (500 Internal Server Error)",
+			});
+		});
+
+		test("detail endpoint omits internalErrorDetails and its content", async () => {
+			const res = await app.request("/logs/stealth-error-log-id", {
+				method: "GET",
+				headers: {
+					Cookie: token,
+				},
+			});
+
+			expect(res.status).toBe(200);
+			const text = await res.text();
+			expect(text).not.toContain("internalErrorDetails");
+			expect(text).not.toContain(SECRET);
+			expect(text).not.toContain("secretvendor.com");
+
+			const json = JSON.parse(text);
+			expect("internalErrorDetails" in json.log).toBe(false);
+			expect(json.log.errorDetails.responseText).toBe(
+				"Upstream provider error (500 Internal Server Error)",
+			);
+		});
+	});
+
+	// Network failures log a bare "fetch failed" message; the actual reason only
+	// exists in the cause chain, so the public endpoints have to serve it for the
+	// dashboard to show anything useful.
+	describe("error cause is served to the dashboard", () => {
+		const CAUSE =
+			"HeadersTimeoutError: Headers Timeout Error (code: UND_ERR_HEADERS_TIMEOUT)";
+
+		beforeEach(async () => {
+			await db.insert(tables.log).values({
+				id: "fetch-failed-log-id",
+				requestId: "fetch-failed-log-id",
+				organizationId: "test-org-id",
+				projectId: "test-project-id",
+				apiKeyId: "test-api-key-id",
+				duration: 301880,
+				requestedModel: "gpt-4",
+				requestedProvider: "openai",
+				usedModel: "gpt-4",
+				usedProvider: "openai",
+				responseSize: 0,
+				finishReason: "upstream_error",
+				unifiedFinishReason: "upstream_error",
+				hasError: true,
+				errorDetails: {
+					statusCode: 0,
+					statusText: "TypeError",
+					responseText: "fetch failed",
+					cause: CAUSE,
+				},
+				messages: JSON.stringify([{ role: "user", content: "Hello" }]),
+				mode: "credits",
+				usedMode: "credits",
+			});
+		});
+
+		test("list endpoint serves the error cause", async () => {
+			const params = new URLSearchParams({ projectId: "test-project-id" });
+			const res = await app.request("/logs?" + params, {
+				method: "GET",
+				headers: {
+					Cookie: token,
+				},
+			});
+
+			expect(res.status).toBe(200);
+			const json = await res.json();
+			const log = json.logs.find(
+				(entry: { id: string }) => entry.id === "fetch-failed-log-id",
+			);
+			expect(log.errorDetails.cause).toBe(CAUSE);
+		});
+
+		test("detail endpoint serves the error cause", async () => {
+			const res = await app.request("/logs/fetch-failed-log-id", {
+				method: "GET",
+				headers: {
+					Cookie: token,
+				},
+			});
+
+			expect(res.status).toBe(200);
+			const json = await res.json();
+			expect(json.log.errorDetails).toEqual({
+				statusCode: 0,
+				statusText: "TypeError",
+				responseText: "fetch failed",
+				cause: CAUSE,
+			});
+		});
+	});
+	// Project access is not key access: a developer may only read logs produced by
+	// the api keys they created, since the payload holds the full prompt and
+	// completion.
+	describe("developer key scoping", () => {
+		const SECRET_PROMPT = "teammate-confidential-prompt";
+
+		beforeEach(async () => {
+			await db
+				.update(tables.userOrganization)
+				.set({ role: "developer" })
+				.where(eq(tables.userOrganization.id, "test-user-org-id"));
+
+			await db.insert(tables.userProject).values({
+				id: "scoping-user-project-id",
+				userOrganizationId: "test-user-org-id",
+				projectId: "test-project-id",
+			});
+
+			await db.insert(tables.user).values({
+				id: "teammate-id",
+				name: "Teammate",
+				email: "teammate@example.com",
+				emailVerified: true,
+			});
+
+			await db.insert(tables.apiKey).values({
+				id: "teammate-key",
+				token: "teammate-token",
+				projectId: "test-project-id",
+				description: "Teammate Key",
+				createdBy: "teammate-id",
+			});
+
+			await db.insert(tables.log).values({
+				id: "teammate-log-id",
+				requestId: "teammate-log-id",
+				organizationId: "test-org-id",
+				projectId: "test-project-id",
+				apiKeyId: "teammate-key",
+				duration: 100,
+				requestedModel: "gpt-4",
+				requestedProvider: "openai",
+				usedModel: "teammate-only-model",
+				usedProvider: "openai",
+				responseSize: 1000,
+				content: "teammate response",
+				promptTokens: "10",
+				completionTokens: "20",
+				totalTokens: "30",
+				messages: JSON.stringify([{ role: "user", content: SECRET_PROMPT }]),
+				mode: "api-keys",
+				usedMode: "api-keys",
+			});
+		});
+
+		test("list omits a teammate's logs and their payloads", async () => {
+			const res = await app.request("/logs?projectId=test-project-id", {
+				headers: { Cookie: token },
+			});
+			expect(res.status).toBe(200);
+			const text = await res.text();
+			expect(text).not.toContain(SECRET_PROMPT);
+
+			const json = JSON.parse(text);
+			const ids = json.logs.map((log: { id: string }) => log.id);
+			expect(ids).not.toContain("teammate-log-id");
+			expect(ids).toContain("test-log-id-1");
+		});
+
+		test("detail rejects a teammate's log", async () => {
+			const res = await app.request("/logs/teammate-log-id", {
+				headers: { Cookie: token },
+			});
+			expect(res.status).toBe(403);
+			expect(await res.text()).not.toContain(SECRET_PROMPT);
+		});
+
+		test("detail still serves the caller's own log", async () => {
+			const res = await app.request("/logs/test-log-id-1", {
+				headers: { Cookie: token },
+			});
+			expect(res.status).toBe(200);
+		});
+
+		test("rejects filtering by a teammate's api key", async () => {
+			const res = await app.request(
+				"/logs?projectId=test-project-id&apiKeyId=teammate-key",
+				{ headers: { Cookie: token } },
+			);
+			expect(res.status).toBe(403);
+		});
+
+		test("unique-models omits a teammate's models", async () => {
+			const res = await app.request(
+				"/logs/unique-models?projectId=test-project-id",
+				{ headers: { Cookie: token } },
+			);
+			expect(res.status).toBe(200);
+			const json = await res.json();
+			expect(json.models).not.toContain("teammate-only-model");
+		});
+
+		test("owners still see the whole project", async () => {
+			await db
+				.update(tables.userOrganization)
+				.set({ role: "owner" })
+				.where(eq(tables.userOrganization.id, "test-user-org-id"));
+
+			const res = await app.request("/logs?projectId=test-project-id", {
+				headers: { Cookie: token },
+			});
+			expect(res.status).toBe(200);
+			const json = await res.json();
+			const ids = json.logs.map((log: { id: string }) => log.id);
+			expect(ids).toContain("teammate-log-id");
 		});
 	});
 });

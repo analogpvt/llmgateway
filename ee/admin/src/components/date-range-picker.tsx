@@ -1,22 +1,6 @@
 "use client";
 
-import {
-	endOfMonth,
-	endOfQuarter,
-	endOfWeek,
-	endOfYear,
-	format,
-	getQuarter,
-	startOfMonth,
-	startOfQuarter,
-	startOfWeek,
-	startOfYear,
-	subDays,
-	subMonths,
-	subQuarters,
-	subWeeks,
-	subYears,
-} from "date-fns";
+import { endOfMonth, format, startOfMonth } from "date-fns";
 import { ChevronDownIcon, ChevronLeftIcon } from "lucide-react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useMemo, useState } from "react";
@@ -27,13 +11,13 @@ import {
 	PopoverContent,
 	PopoverTrigger,
 } from "@/components/ui/popover";
+import {
+	ALL_TIME_RANGE,
+	RELATIVE_RANGE_PRESETS,
+	findRelativeRangePreset,
+	resolveDateRange,
+} from "@/lib/date-range";
 import { cn } from "@/lib/utils";
-
-interface DatePreset {
-	label: string;
-	value: string;
-	getRange: () => { from: Date; to: Date };
-}
 
 const MONTH_NAMES = [
 	"Jan",
@@ -50,155 +34,28 @@ const MONTH_NAMES = [
 	"Dec",
 ];
 
-function getQuarterLabel(date: Date): string {
-	return `Q${getQuarter(date)} ${format(date, "yyyy")}`;
-}
+export function getDateRangeFromParams(
+	searchParams: URLSearchParams,
+	defaultRange?: string,
+) {
+	const resolved = resolveDateRange(
+		{
+			range: searchParams.get("range") ?? undefined,
+			from: searchParams.get("from") ?? undefined,
+			to: searchParams.get("to") ?? undefined,
+		},
+		defaultRange,
+	);
 
-function buildPresets(): DatePreset[] {
-	const today = new Date();
-	return [
-		{
-			label: "Custom",
-			value: "custom",
-			getRange: () => ({ from: subDays(today, 6), to: today }),
-		},
-		{
-			label: "Today",
-			value: "today",
-			getRange: () => ({ from: today, to: today }),
-		},
-		{
-			label: "This week",
-			value: "this_week",
-			getRange: () => ({
-				from: startOfWeek(today, { weekStartsOn: 1 }),
-				to: today,
-			}),
-		},
-		{
-			label: "This month",
-			value: "this_month",
-			getRange: () => ({ from: startOfMonth(today), to: today }),
-		},
-		{
-			label: "This year",
-			value: "this_year",
-			getRange: () => ({ from: startOfYear(today), to: today }),
-		},
-		{
-			label: "Last week",
-			value: "last_week",
-			getRange: () => {
-				const lw = subWeeks(today, 1);
-				return {
-					from: startOfWeek(lw, { weekStartsOn: 1 }),
-					to: endOfWeek(lw, { weekStartsOn: 1 }),
-				};
-			},
-		},
-		{
-			label: "Last month",
-			value: "last_month",
-			getRange: () => {
-				const lm = subMonths(today, 1);
-				return { from: startOfMonth(lm), to: endOfMonth(lm) };
-			},
-		},
-		{
-			label: "Last year",
-			value: "last_year",
-			getRange: () => {
-				const ly = subYears(today, 1);
-				return { from: startOfYear(ly), to: endOfYear(ly) };
-			},
-		},
-		{
-			label: "Last 30 days",
-			value: "last_30_days",
-			getRange: () => ({ from: subDays(today, 29), to: today }),
-		},
-		{
-			label: "Last 90 days",
-			value: "last_90_days",
-			getRange: () => ({ from: subDays(today, 89), to: today }),
-		},
-		{
-			label: "Last 6 months",
-			value: "last_6_months",
-			getRange: () => ({ from: subMonths(today, 6), to: today }),
-		},
-		{
-			label: `This quarter (${getQuarterLabel(today)})`,
-			value: "this_quarter",
-			getRange: () => ({ from: startOfQuarter(today), to: today }),
-		},
-		{
-			label: `Last quarter (${getQuarterLabel(subQuarters(today, 1))})`,
-			value: "last_quarter",
-			getRange: () => {
-				const lq = subQuarters(today, 1);
-				return { from: startOfQuarter(lq), to: endOfQuarter(lq) };
-			},
-		},
-		{
-			label: `2 quarters ago (${getQuarterLabel(subQuarters(today, 2))})`,
-			value: "2_quarters_ago",
-			getRange: () => {
-				const q = subQuarters(today, 2);
-				return { from: startOfQuarter(q), to: endOfQuarter(q) };
-			},
-		},
-		{
-			label: `3 quarters ago (${getQuarterLabel(subQuarters(today, 3))})`,
-			value: "3_quarters_ago",
-			getRange: () => {
-				const q = subQuarters(today, 3);
-				return { from: startOfQuarter(q), to: endOfQuarter(q) };
-			},
-		},
-		{
-			label: "All time",
-			value: "all_time",
-			getRange: () => ({ from: new Date(2020, 0, 1), to: today }),
-		},
-	];
-}
-
-function findMatchingPreset(
-	from: Date,
-	to: Date,
-	presets: DatePreset[],
-): string {
-	for (const preset of presets) {
-		// "all_time" is tracked via the absence of from/to in the URL, not
-		// by concrete range equality — skip it here.
-		if (preset.value === "custom" || preset.value === "all_time") {
-			continue;
-		}
-		const range = preset.getRange();
-		if (
-			format(from, "yyyy-MM-dd") === format(range.from, "yyyy-MM-dd") &&
-			format(to, "yyyy-MM-dd") === format(range.to, "yyyy-MM-dd")
-		) {
-			return preset.value;
-		}
-	}
-	return "custom";
-}
-
-export function getDateRangeFromParams(searchParams: URLSearchParams) {
-	const fromParam = searchParams.get("from");
-	const toParam = searchParams.get("to");
-
-	if (fromParam && toParam) {
+	if (resolved.from && resolved.to) {
 		return {
-			from: new Date(fromParam + "T00:00:00"),
-			to: new Date(toParam + "T00:00:00"),
+			from: new Date(resolved.from + "T00:00:00"),
+			to: new Date(resolved.to + "T00:00:00"),
 			isAllTime: false,
 		};
 	}
 
-	// Default: no from/to in URL means "all time". Return concrete dates
+	// Default: no range/from/to in URL means "all time". Return concrete dates
 	// for calendar/display purposes only; callers that build API requests
 	// should rely on isAllTime (and omit from/to params) to let the backend
 	// use its native all-time aggregate path.
@@ -337,7 +194,7 @@ function MonthRangePicker({ from, to, onSelect }: MonthRangePickerProps) {
 	);
 }
 
-export function DateRangePicker() {
+export function DateRangePicker({ defaultRange }: { defaultRange?: string }) {
 	const router = useRouter();
 	const pathname = usePathname();
 	const searchParams = useSearchParams();
@@ -345,12 +202,41 @@ export function DateRangePicker() {
 	const [search, setSearch] = useState("");
 	const [showCalendar, setShowCalendar] = useState(false);
 
-	const { from, to, isAllTime } = getDateRangeFromParams(searchParams);
-	const presets = useMemo(() => buildPresets(), []);
-	const activePreset = useMemo(
-		() => (isAllTime ? "all_time" : findMatchingPreset(from, to, presets)),
-		[from, to, presets, isAllTime],
+	const { from, to, isAllTime } = getDateRangeFromParams(
+		searchParams,
+		defaultRange,
 	);
+	const today = useMemo(() => new Date(), []);
+
+	const presets = useMemo(
+		() => [
+			{ label: "Custom", value: "custom" },
+			...RELATIVE_RANGE_PRESETS.map((p) => ({
+				label: p.getLabel(today),
+				value: p.value,
+			})),
+			{ label: "All time", value: ALL_TIME_RANGE },
+		],
+		[today],
+	);
+
+	const activePreset = useMemo(() => {
+		const rangeParam = searchParams.get("range") ?? undefined;
+		if (findRelativeRangePreset(rangeParam)) {
+			return rangeParam as string;
+		}
+		if (rangeParam === ALL_TIME_RANGE) {
+			return ALL_TIME_RANGE;
+		}
+		// An empty URL means the page's own default is in force, so highlight
+		// that preset rather than the one the empty URL would otherwise imply.
+		const hasCustomSpan =
+			Boolean(searchParams.get("from")) && Boolean(searchParams.get("to"));
+		if (!hasCustomSpan && findRelativeRangePreset(defaultRange)) {
+			return defaultRange as string;
+		}
+		return isAllTime ? ALL_TIME_RANGE : "custom";
+	}, [searchParams, isAllTime, defaultRange]);
 
 	const filteredPresets = useMemo(
 		() =>
@@ -370,29 +256,41 @@ export function DateRangePicker() {
 		router.push(`${pathname}?${params.toString()}`);
 	};
 
-	const clearDateRange = () => {
+	const selectAllTime = () => {
 		const params = new URLSearchParams(searchParams.toString());
-		params.delete("range");
 		params.delete("from");
 		params.delete("to");
+		// On a page with its own default, an empty URL means that default, so
+		// "all time" has to be written out to override it. Pages without a
+		// default keep the shorter URL, which resolves to all time either way.
+		if (defaultRange) {
+			params.set("range", ALL_TIME_RANGE);
+		} else {
+			params.delete("range");
+		}
 		const qs = params.toString();
 		router.push(qs ? `${pathname}?${qs}` : pathname);
 	};
 
-	const handlePresetSelect = (preset: DatePreset) => {
-		if (preset.value === "custom") {
+	const handlePresetSelect = (value: string) => {
+		if (value === "custom") {
 			setShowCalendar(true);
 			return;
 		}
-		// "All time" leaves the URL without from/to so the API uses its
-		// native all-time aggregate path instead of a concrete 2020→today range.
-		if (preset.value === "all_time") {
-			clearDateRange();
+		// "All time" keeps range/from/to off the URL so the API uses its native
+		// all-time aggregate path instead of a concrete 2020→today range.
+		if (value === ALL_TIME_RANGE) {
+			selectAllTime();
 			setOpen(false);
 			return;
 		}
-		const range = preset.getRange();
-		updateDateRange(range.from, range.to);
+		// Relative presets only store the preset value; the concrete dates are
+		// resolved against "today" on every request.
+		const params = new URLSearchParams(searchParams.toString());
+		params.delete("from");
+		params.delete("to");
+		params.set("range", value);
+		router.push(`${pathname}?${params.toString()}`);
 		setOpen(false);
 	};
 
@@ -403,9 +301,11 @@ export function DateRangePicker() {
 	};
 
 	const triggerLabel = useMemo(() => {
-		const preset = presets.find((p) => p.value === activePreset);
-		if (preset && preset.value !== "custom") {
-			return preset.label;
+		if (activePreset !== "custom") {
+			const preset = presets.find((p) => p.value === activePreset);
+			if (preset) {
+				return preset.label;
+			}
 		}
 		return `${format(from, "MMM d, yyyy")} – ${format(to, "MMM d, yyyy")}`;
 	}, [activePreset, from, to, presets]);
@@ -449,7 +349,7 @@ export function DateRangePicker() {
 								<button
 									key={preset.value}
 									type="button"
-									onClick={() => handlePresetSelect(preset)}
+									onClick={() => handlePresetSelect(preset.value)}
 									className={cn(
 										"w-full px-3 py-2 text-left text-sm transition-colors hover:bg-accent",
 										activePreset === preset.value && "bg-accent/50",

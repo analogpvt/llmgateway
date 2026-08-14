@@ -1,6 +1,5 @@
 "use client";
 
-import { subDays } from "date-fns";
 import {
 	ArrowLeft,
 	ChevronDown,
@@ -8,26 +7,42 @@ import {
 	Clock,
 	Coins,
 	Cpu,
+	Download,
 	Terminal,
 	Zap,
 } from "lucide-react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { LogCard } from "@/components/dashboard/log-card";
+import {
+	UsageModeSelector,
+	useUsageMode,
+} from "@/components/shared/usage-mode-selector";
 import {
 	TimeRangePicker,
 	type TimeRangeValue,
 } from "@/components/time-range-picker";
 import { useDashboardNavigation } from "@/hooks/useDashboardNavigation";
-import { useApi } from "@/lib/fetch-client";
+import {
+	AGENT_TIME_RANGE_HOURS,
+	AGENT_TIME_RANGES,
+	parseAgentTimeRange,
+} from "@/lib/agent-time-ranges";
+import { useToast } from "@/lib/components/use-toast";
+import { useApi, useFetchClient } from "@/lib/fetch-client";
+import { applyUsageMode } from "@/lib/usage-mode";
 
+import { buildAgentLogsCsv, CODING_AGENTS } from "@llmgateway/shared";
 import {
 	AnthropicIcon,
 	AutohandIcon,
 	ClineIcon,
 	CodexIcon,
 	CursorIcon,
+	DevPassCodeIcon,
+	EmpryoIcon,
+	GitHubCopilotIcon,
 	N8nIcon,
 	OpenClawIcon,
 	OpenCodeIcon,
@@ -51,64 +66,28 @@ interface AgentDefinition {
 	sources: string[];
 }
 
-const AGENTS: AgentDefinition[] = [
-	{
-		id: "claude-code",
-		label: "Claude Code",
-		icon: AnthropicIcon,
-		sources: ["claude.com/claude-code"],
-	},
-	{
-		id: "opencode",
-		label: "OpenCode",
-		icon: OpenCodeIcon,
-		sources: ["opencode", "open-code"],
-	},
-	{
-		id: "cursor",
-		label: "Cursor",
-		icon: CursorIcon,
-		sources: ["cursor"],
-	},
-	{
-		id: "autohand",
-		label: "Autohand Code",
-		icon: AutohandIcon,
-		sources: ["autohand"],
-	},
-	{
-		id: "soulforge",
-		label: "SoulForge",
-		icon: SoulForgeIcon,
-		sources: ["soulforge"],
-	},
-	{
-		id: "cline",
-		label: "Cline",
-		icon: ClineIcon,
-		sources: ["cline"],
-	},
-	{
-		id: "codex",
-		label: "Codex CLI",
-		icon: CodexIcon,
-		sources: ["codex"],
-	},
-	{
-		id: "n8n",
-		label: "n8n",
-		icon: N8nIcon,
-		sources: ["n8n"],
-	},
-	{
-		id: "openclaw",
-		label: "OpenClaw",
-		icon: OpenClawIcon,
-		sources: ["openclaw"],
-	},
-];
+const AGENT_ICONS: Record<string, IconComponent> = {
+	"devpass-code": DevPassCodeIcon,
+	"claude.com/claude-code": AnthropicIcon,
+	opencode: OpenCodeIcon,
+	cursor: CursorIcon,
+	autohand: AutohandIcon,
+	empryo: EmpryoIcon,
+	soulforge: SoulForgeIcon,
+	cline: ClineIcon,
+	"roo-code": ClineIcon,
+	codex: CodexIcon,
+	"github-copilot": GitHubCopilotIcon,
+	n8n: N8nIcon,
+	openclaw: OpenClawIcon,
+};
 
-const AGENTS_TIME_RANGES = ["7d", "30d"] as const;
+const AGENTS: AgentDefinition[] = CODING_AGENTS.map((agent) => ({
+	id: agent.id,
+	label: agent.label,
+	icon: AGENT_ICONS[agent.id] ?? Terminal,
+	sources: agent.xSourceValues,
+}));
 
 interface AgentStats {
 	agent: AgentDefinition;
@@ -132,8 +111,14 @@ interface Session {
 
 const SESSION_GAP_MS = 30 * 60 * 1000;
 
-function timeRangeToDays(timeRange: TimeRangeValue): number {
-	return timeRange === "30d" ? 30 : 7;
+function getTimeRangeWindow(timeRange: TimeRangeValue): {
+	from: Date;
+	to: Date;
+} {
+	const to = new Date();
+	const windowMs = AGENT_TIME_RANGE_HOURS[timeRange] * 60 * 60 * 1000;
+	const from = new Date(to.getTime() - windowMs);
+	return { from, to };
 }
 
 function toUiLog(log: ApiLog): Partial<Log> {
@@ -424,10 +409,21 @@ function AgentDetail({
 	const api = useApi();
 
 	const range = useMemo(() => {
-		const to = new Date();
-		const from = subDays(to, timeRangeToDays(timeRange));
+		const { from, to } = getTimeRangeWindow(timeRange);
 		return { from: from.toISOString(), to: to.toISOString() };
 	}, [timeRange]);
+
+	const logsQuery = useMemo(
+		() => ({
+			orderBy: "createdAt_desc" as const,
+			projectId,
+			limit: "100",
+			source: stats.agent.sources.join(","),
+			startDate: range.from,
+			endDate: range.to,
+		}),
+		[projectId, stats.agent.sources, range.from, range.to],
+	);
 
 	const {
 		data,
@@ -441,14 +437,7 @@ function AgentDetail({
 		"/logs",
 		{
 			params: {
-				query: {
-					orderBy: "createdAt_desc",
-					projectId,
-					limit: "100",
-					source: stats.agent.sources.join(","),
-					startDate: range.from,
-					endDate: range.to,
-				},
+				query: logsQuery,
 			},
 		},
 		{
@@ -473,6 +462,81 @@ function AgentDetail({
 
 	const sessions = useMemo(() => groupLogsIntoSessions(logs), [logs]);
 
+	const sentinelRef = useRef<HTMLDivElement | null>(null);
+
+	// Auto-load next page when the sentinel scrolls into view.
+	useEffect(() => {
+		const node = sentinelRef.current;
+		if (!node || !hasNextPage || isFetchingNextPage) {
+			return;
+		}
+		const observer = new IntersectionObserver(
+			(entries) => {
+				if (entries[0]?.isIntersecting) {
+					void fetchNextPage();
+				}
+			},
+			{ rootMargin: "400px" },
+		);
+		observer.observe(node);
+		return () => observer.disconnect();
+	}, [hasNextPage, isFetchingNextPage, fetchNextPage]);
+
+	const fetchClient = useFetchClient();
+	const { toast } = useToast();
+	const [isExporting, setIsExporting] = useState(false);
+
+	const handleExportCsv = useCallback(async () => {
+		setIsExporting(true);
+		try {
+			// Pages already loaded via the infinite query are reused to avoid
+			// re-fetching them; remaining pages are fetched directly. Any failed
+			// page fetch aborts the export so a partial CSV is never downloaded.
+			const pages = data?.pages ?? [];
+			const collected: ApiLog[] = pages.flatMap((page) => page?.logs ?? []);
+			const lastPage = pages[pages.length - 1];
+			let cursor = lastPage?.pagination?.hasMore
+				? (lastPage.pagination.nextCursor ?? undefined)
+				: undefined;
+			while (cursor) {
+				const res = await fetchClient.GET("/logs", {
+					params: {
+						query: { ...logsQuery, cursor },
+					},
+				});
+				const body = res.data;
+				if (!body) {
+					throw new Error("Failed to fetch logs for export");
+				}
+				collected.push(...body.logs);
+				cursor = body.pagination.hasMore
+					? (body.pagination.nextCursor ?? undefined)
+					: undefined;
+			}
+			const csv = buildAgentLogsCsv(
+				collected.filter((log) => !log.retriedByLogId),
+			);
+			const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+			const url = URL.createObjectURL(blob);
+			const a = document.createElement("a");
+			a.href = url;
+			a.download = `${stats.agent.id}-requests-${timeRange}.csv`;
+			document.body.appendChild(a);
+			a.click();
+			document.body.removeChild(a);
+			URL.revokeObjectURL(url);
+		} catch {
+			toast({
+				title: "Export failed",
+				description:
+					"Could not fetch all requests for this period. Please try again.",
+				variant: "destructive",
+			});
+		} finally {
+			setIsExporting(false);
+		}
+	}, [data, fetchClient, logsQuery, stats.agent.id, timeRange, toast]);
+
 	return (
 		<div className="space-y-4">
 			<button
@@ -484,25 +548,38 @@ function AgentDetail({
 				Back to agents
 			</button>
 
-			<div className="flex items-center gap-4 pb-2">
-				<div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg bg-muted">
-					<Icon className="h-6 w-6" />
-				</div>
-				<div>
-					<h3 className="text-lg font-semibold tracking-tight">
-						{stats.agent.label}
-					</h3>
-					<div className="flex items-center gap-3 text-sm text-muted-foreground">
-						<span>
-							{stats.requestCount.toLocaleString()} request
-							{stats.requestCount !== 1 ? "s" : ""}
-						</span>
-						<span className="text-border">&middot;</span>
-						<span>${stats.totalCost.toFixed(2)}</span>
-						<span className="text-border">&middot;</span>
-						<span>{formatTokens(stats.totalTokens)} tokens</span>
+			<div className="flex items-center justify-between gap-4 pb-2">
+				<div className="flex items-center gap-4">
+					<div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-lg bg-muted">
+						<Icon className="h-6 w-6" />
+					</div>
+					<div>
+						<h3 className="text-lg font-semibold tracking-tight">
+							{stats.agent.label}
+						</h3>
+						<div className="flex items-center gap-3 text-sm text-muted-foreground">
+							<span>
+								{logs.length.toLocaleString()} of{" "}
+								{stats.requestCount.toLocaleString()} request
+								{stats.requestCount !== 1 ? "s" : ""}
+							</span>
+							<span className="text-border">&middot;</span>
+							<span>${stats.totalCost.toFixed(2)}</span>
+							<span className="text-border">&middot;</span>
+							<span>{formatTokens(stats.totalTokens)} tokens</span>
+						</div>
 					</div>
 				</div>
+				<button
+					type="button"
+					onClick={handleExportCsv}
+					disabled={isExporting || logs.length === 0}
+					className="inline-flex items-center gap-2 rounded-md border px-3 py-1.5 text-sm font-medium text-muted-foreground transition-colors hover:bg-muted/50 disabled:opacity-50"
+					title="Export all requests in this period to CSV"
+				>
+					<Download className="h-4 w-4" />
+					{isExporting ? "Exporting..." : "Export CSV"}
+				</button>
 			</div>
 
 			<div className="space-y-3">
@@ -530,6 +607,8 @@ function AgentDetail({
 					))
 				)}
 
+				{/* Auto-load sentinel: fetches the next page when scrolled into view. */}
+				<div ref={sentinelRef} className="h-1" />
 				{hasNextPage && (
 					<div className="flex justify-center pt-2">
 						<button
@@ -560,7 +639,7 @@ function EmptyState() {
 				No agent activity yet
 			</h3>
 			<p className="text-sm text-muted-foreground max-w-sm text-center mb-6">
-				Activity appears when coding agents like Claude Code, Autohand Code,
+				Activity appears when coding agents like DevPass Code, Claude Code,
 				OpenCode, Cursor, or Cline make API requests through the gateway.
 			</p>
 			<div className="flex flex-wrap items-center justify-center gap-4">
@@ -594,9 +673,9 @@ export function AgentsView({
 	const searchParams = useSearchParams();
 	const { buildUrl } = useDashboardNavigation();
 	const api = useApi();
+	const usageMode = useUsageMode();
 
-	const timeRange: TimeRangeValue =
-		searchParams.get("timeRange") === "30d" ? "30d" : "7d";
+	const timeRange = parseAgentTimeRange(searchParams.get("timeRange"));
 
 	const updateTimeRange = (newTimeRange: TimeRangeValue) => {
 		const params = new URLSearchParams(searchParams);
@@ -624,8 +703,11 @@ export function AgentsView({
 	);
 
 	const agentStats = useMemo(
-		() => computeAgentStats(data?.sources ?? []),
-		[data],
+		() =>
+			computeAgentStats(
+				(data?.sources ?? []).map((row) => applyUsageMode(row, usageMode)),
+			),
+		[data, usageMode],
 	);
 
 	const selectedStats = selectedAgentId
@@ -638,11 +720,14 @@ export function AgentsView({
 	return (
 		<div className="space-y-6">
 			<div className="flex flex-wrap items-center justify-between gap-4">
-				<TimeRangePicker
-					value={timeRange}
-					onChange={updateTimeRange}
-					allowedValues={AGENTS_TIME_RANGES}
-				/>
+				<div className="flex flex-wrap items-center gap-3">
+					<TimeRangePicker
+						value={timeRange}
+						onChange={updateTimeRange}
+						allowedValues={AGENT_TIME_RANGES}
+					/>
+					<UsageModeSelector />
+				</div>
 				{!selectedStats && agentStats.length > 0 && (
 					<div className="flex items-center gap-3 text-sm text-muted-foreground">
 						<span>

@@ -5,6 +5,8 @@ import { z } from "zod";
 import { userHasOrganizationAccess } from "@/utils/authorization.js";
 
 import { db } from "@llmgateway/db";
+import { logger } from "@llmgateway/logger";
+import { buildSignedGatewayVideoLogContentUrl } from "@llmgateway/shared/video-access";
 
 import type { ServerTypes } from "@/vars.js";
 
@@ -42,6 +44,15 @@ const videoJobResponseSchema = z.object({
 			details: z.unknown().optional(),
 		})
 		.nullable(),
+	content: z
+		.array(
+			z.object({
+				type: z.literal("video"),
+				url: z.string(),
+				mime_type: z.string().nullable().optional(),
+			}),
+		)
+		.optional(),
 });
 
 const getVideoStatus = createRoute({
@@ -92,6 +103,31 @@ video.openapi(getVideoStatus, async (c) => {
 		throw new HTTPException(404, { message: "Video not found" });
 	}
 
+	// Signing needs LLM_VIDEO_CONTENT_JWT_SECRET. If that is missing or invalid
+	// only playback is broken, so keep the failure scoped to `content` instead of
+	// failing the whole response: clients poll this endpoint to learn a job
+	// reached a terminal state, and a 500 here strands finished (already billed)
+	// generations on "in progress" forever.
+	let content:
+		{ type: "video"; url: string; mime_type?: string | null }[] | undefined;
+	if (job.status === "completed" && job.logId) {
+		try {
+			content = [
+				{
+					type: "video" as const,
+					url: buildSignedGatewayVideoLogContentUrl(job.logId),
+					mime_type: job.contentType ?? null,
+				},
+			];
+		} catch (error) {
+			logger.error("Failed to sign video content URL", {
+				videoId: job.id,
+				logId: job.logId,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
 	return c.json(
 		{
 			id: job.id,
@@ -107,6 +143,7 @@ video.openapi(getVideoStatus, async (c) => {
 			completed_at: toUnixTimestamp(job.completedAt),
 			expires_at: toUnixTimestamp(job.expiresAt),
 			error: job.error ?? null,
+			content,
 		},
 		200,
 	);

@@ -1,21 +1,34 @@
 "use client";
 
 import { format, parseISO } from "date-fns";
-import { BarChart3, Coins, Cpu, Layers } from "lucide-react";
+import {
+	BarChart3,
+	Building2,
+	Coins,
+	Cpu,
+	Layers,
+	Server,
+	Wallet,
+} from "lucide-react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useCallback, useMemo, useState } from "react";
 import {
+	Bar,
+	BarChart,
 	CartesianGrid,
 	Cell,
 	Legend,
-	Line,
-	LineChart,
 	Pie,
 	PieChart,
 	XAxis,
 	YAxis,
 } from "recharts";
 
+import {
+	GlobalStatsRangePicker,
+	resolveGlobalStatsRange,
+} from "@/components/global-stats-range-picker";
+import { OrgKindSelector, useOrgKind } from "@/components/org-kind-selector";
 import { Button } from "@/components/ui/button";
 import {
 	Card,
@@ -26,28 +39,38 @@ import {
 } from "@/components/ui/card";
 import {
 	ChartContainer,
+	ChartLegend,
+	ChartLegendContent,
 	ChartTooltip,
 	ChartTooltipContent,
 } from "@/components/ui/chart";
+import {
+	UsageModeSelector,
+	useUsageMode,
+} from "@/components/usage-mode-selector";
 import { useApi } from "@/lib/fetch-client";
+import { orgKindDescription, orgKindLabel } from "@/lib/org-kind";
+import { usageModeDescription, usageModeLabel } from "@/lib/usage-mode";
 import { cn } from "@/lib/utils";
 
 import type { ChartConfig } from "@/components/ui/chart";
 
-type Range = "7d" | "30d" | "90d" | "365d";
-type GroupBy = "model" | "source";
-type ModelView = "mapping" | "canonical";
+type GroupBy = "model" | "source" | "mode" | "kind";
+type ModelView = "mapping" | "canonical" | "provider";
 
-const RANGE_OPTIONS: { value: Range; label: string }[] = [
-	{ value: "7d", label: "Last 7 days" },
-	{ value: "30d", label: "Last 30 days" },
-	{ value: "90d", label: "Last 90 days" },
-	{ value: "365d", label: "Last 365 days" },
-];
+interface CompositionItem {
+	key: string;
+	label: string;
+	requestCount: number;
+	cost: number;
+	totalTokens: number;
+}
 
 const GROUP_OPTIONS: { value: GroupBy; label: string; icon: typeof Cpu }[] = [
 	{ value: "model", label: "By model", icon: Cpu },
 	{ value: "source", label: "By x-source", icon: Layers },
+	{ value: "mode", label: "By mode", icon: Wallet },
+	{ value: "kind", label: "By org kind", icon: Building2 },
 ];
 
 const MODEL_VIEW_OPTIONS: {
@@ -57,6 +80,7 @@ const MODEL_VIEW_OPTIONS: {
 }[] = [
 	{ value: "mapping", label: "Mappings", icon: Layers },
 	{ value: "canonical", label: "Canonical", icon: Cpu },
+	{ value: "provider", label: "Providers", icon: Server },
 ];
 
 // Distinct, color-blind-friendly hues. Repeat for >12 series.
@@ -107,20 +131,20 @@ const timeseriesChartConfig = {
 
 type TimeseriesMetric = keyof typeof timeseriesChartConfig;
 
-const VALID_RANGES: Range[] = ["7d", "30d", "90d", "365d"];
-const VALID_GROUPS: GroupBy[] = ["model", "source"];
+const VALID_GROUPS: GroupBy[] = ["model", "source", "mode", "kind"];
 const VALID_METRICS: TimeseriesMetric[] = [
 	"requestCount",
 	"cost",
 	"totalTokens",
 ];
-const VALID_MODEL_VIEWS: ModelView[] = ["mapping", "canonical"];
+const VALID_MODEL_VIEWS: ModelView[] = ["mapping", "canonical", "provider"];
 
 const BREAKDOWN_PAGE_SIZE = 25;
 
-function parseRange(value: string | null): Range {
-	return VALID_RANGES.includes(value as Range) ? (value as Range) : "30d";
-}
+// Max distinct series in the stacked bar chart before the rest collapse into "Other".
+const TIMESERIES_STACK_LIMIT = 8;
+const OTHER_KEY = "__other__";
+const OTHER_COLOR = "hsl(215 16% 47%)";
 
 function parseGroupBy(value: string | null): GroupBy {
 	return VALID_GROUPS.includes(value as GroupBy) ? (value as GroupBy) : "model";
@@ -136,6 +160,10 @@ function parseModelView(value: string | null): ModelView {
 	return VALID_MODEL_VIEWS.includes(value as ModelView)
 		? (value as ModelView)
 		: "mapping";
+}
+
+function parseBreakdown(value: string | null): boolean {
+	return value === "1";
 }
 
 function StatCard({
@@ -187,6 +215,22 @@ function StatCard({
 	);
 }
 
+/**
+ * "PAYG: $12.30 · DevPass: $4.10" from a composition slice, skipping empty
+ * buckets. Null when there is nothing to compare against, so the caller can
+ * fall back to a different subtitle.
+ */
+function compositionSubtitle(
+	items: CompositionItem[] | undefined,
+	format: (item: CompositionItem) => string,
+): string | null {
+	const populated = (items ?? []).filter((item) => item.requestCount > 0);
+	if (populated.length < 2) {
+		return null;
+	}
+	return populated.map((item) => `${item.label}: ${format(item)}`).join(" · ");
+}
+
 function metricFormatter(metric: TimeseriesMetric) {
 	switch (metric) {
 		case "cost":
@@ -215,10 +259,13 @@ export function GlobalStatsClient() {
 	const pathname = usePathname();
 	const searchParams = useSearchParams();
 
-	const range = parseRange(searchParams.get("range"));
+	const { allTime, from, to } = resolveGlobalStatsRange(searchParams);
+	const usageMode = useUsageMode();
+	const orgKind = useOrgKind();
 	const groupBy = parseGroupBy(searchParams.get("groupBy"));
 	const chartMetric = parseMetric(searchParams.get("metric"));
 	const modelView = parseModelView(searchParams.get("modelView"));
+	const showTimeseriesBreakdown = parseBreakdown(searchParams.get("breakdown"));
 
 	const updateParam = useCallback(
 		(key: string, value: string) => {
@@ -231,13 +278,16 @@ export function GlobalStatsClient() {
 
 	const [breakdownPage, setBreakdownPage] = useState(1);
 
-	const setRange = useCallback(
-		(value: Range) => {
-			setBreakdownPage(1);
-			updateParam("range", value);
-		},
-		[updateParam],
-	);
+	// The range picker and the mode/kind selectors write to the URL directly, so
+	// reset pagination during render when any of them changes (each also
+	// re-sorts the breakdown).
+	const viewKey = `${allTime ? "all" : `${from}|${to}`}|${usageMode}|${orgKind}`;
+	const [lastViewKey, setLastViewKey] = useState(viewKey);
+	if (viewKey !== lastViewKey) {
+		setLastViewKey(viewKey);
+		setBreakdownPage(1);
+	}
+
 	const setGroupBy = useCallback(
 		(value: GroupBy) => {
 			setBreakdownPage(1);
@@ -259,19 +309,91 @@ export function GlobalStatsClient() {
 		},
 		[updateParam],
 	);
+	const toggleTimeseriesBreakdown = useCallback(() => {
+		updateParam("breakdown", showTimeseriesBreakdown ? "0" : "1");
+	}, [updateParam, showTimeseriesBreakdown]);
 
 	const $api = useApi();
+	// mode/kind are applied server-side (both are part of the aggregation key),
+	// so every metric below is already narrowed to the selected slice and the
+	// filters take part in the query key.
+	// All time carries no bounds: the API derives the span from the first and
+	// last recorded day, so it is requested as `range=all` instead of from/to.
 	const { data, isLoading, isError } = $api.useQuery(
 		"get",
 		"/admin/global-stats",
 		{
-			params: { query: { range, groupBy, modelView } },
+			params: {
+				query: {
+					...(allTime ? { range: "all" as const } : { from, to }),
+					groupBy,
+					modelView,
+					mode: usageMode,
+					kind: orgKind,
+				},
+			},
 		},
 	);
 
+	const rangeLabel = useMemo(() => {
+		const start = from ?? data?.start;
+		const end = to ?? data?.end;
+		if (!start || !end) {
+			return "all time";
+		}
+		const startDate = parseISO(start);
+		const endDate = parseISO(end);
+		if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) {
+			return allTime ? "all time" : "selected range";
+		}
+		return `${format(startDate, "MMM d, yyyy")} – ${format(endDate, "MMM d, yyyy")}`;
+	}, [allTime, from, to, data?.start, data?.end]);
+
 	const totals = data?.totals;
-	const timeseries = data?.timeseries ?? [];
-	const breakdown = data?.breakdown ?? [];
+	const timeseries = useMemo(() => data?.timeseries ?? [], [data?.timeseries]);
+	const timeseriesBreakdown = useMemo(
+		() => data?.timeseriesBreakdown ?? [],
+		[data?.timeseriesBreakdown],
+	);
+	const breakdown = useMemo(() => data?.breakdown ?? [], [data?.breakdown]);
+
+	const composition = data?.composition;
+
+	// Each composition slice deliberately ignores its own filter server-side, so
+	// it still sums to the un-narrowed total. That makes it wrong to show under a
+	// headline the same filter narrowed: "DevPass cost $257" over a list naming
+	// every kind reads as if those were the parts of $257. Only offer the split
+	// while the corresponding dimension is unfiltered.
+	const modeComposition =
+		usageMode === "total" ? composition?.byMode : undefined;
+	const kindComposition = orgKind === "all" ? composition?.byKind : undefined;
+
+	// Rows aggregated before mode/kind attribution existed. A filter silently
+	// excludes them, so say so rather than letting the totals quietly shrink.
+	const unattributedNote = useMemo(() => {
+		const unknownIn = (items: { key: string; requestCount: number }[] = []) =>
+			items.find((item) => item.key === "unknown")?.requestCount ?? 0;
+		const parts: string[] = [];
+		if (usageMode !== "total") {
+			const count = unknownIn(composition?.byMode);
+			if (count > 0) {
+				parts.push(
+					`${numberFormatter.format(count)} requests predate billing-mode attribution`,
+				);
+			}
+		}
+		if (orgKind !== "all") {
+			const count = unknownIn(composition?.byKind);
+			if (count > 0) {
+				parts.push(
+					`${numberFormatter.format(count)} requests predate organization-kind attribution`,
+				);
+			}
+		}
+		return parts.length > 0
+			? `${parts.join(" and ")} — they are excluded from this view.`
+			: null;
+	}, [composition, usageMode, orgKind]);
 
 	// Pie data: top 10 by the selected metric, the rest collapsed into "Other".
 	const pieData = useMemo(() => {
@@ -319,6 +441,84 @@ export function GlobalStatsClient() {
 		[breakdown, chartMetric],
 	);
 
+	// Top dimensions (by the selected metric) shown as their own stacked series;
+	// everything else collapses into a single "Other" bucket.
+	const stackSeries = useMemo(() => {
+		const top = sortedBreakdown.slice(0, TIMESERIES_STACK_LIMIT);
+		const restCount = Math.max(0, sortedBreakdown.length - top.length);
+		const keys = top.map((b) => b.key);
+		if (restCount > 0) {
+			keys.push(OTHER_KEY);
+		}
+		return { top, topKeys: new Set(top.map((b) => b.key)), restCount, keys };
+	}, [sortedBreakdown]);
+
+	const stackChartConfig = useMemo<ChartConfig>(() => {
+		const config: ChartConfig = {};
+		stackSeries.top.forEach((b, idx) => {
+			config[b.key] = {
+				label: b.label,
+				color: PIE_COLORS[idx % PIE_COLORS.length],
+			};
+		});
+		if (stackSeries.restCount > 0) {
+			config[OTHER_KEY] = {
+				label: `Other (${stackSeries.restCount})`,
+				color: OTHER_COLOR,
+			};
+		}
+		return config;
+	}, [stackSeries]);
+
+	const stackedTimeseries = useMemo(() => {
+		const byDate = new Map<string, Record<string, number | string>>();
+		for (const point of timeseries) {
+			byDate.set(point.date, { date: point.date });
+		}
+		for (const row of timeseriesBreakdown) {
+			const entry = byDate.get(row.date);
+			if (!entry) {
+				continue;
+			}
+			const seriesKey = stackSeries.topKeys.has(row.key) ? row.key : OTHER_KEY;
+			entry[seriesKey] =
+				((entry[seriesKey] as number | undefined) ?? 0) + row[chartMetric];
+		}
+		return Array.from(byDate.values());
+	}, [timeseries, timeseriesBreakdown, stackSeries, chartMetric]);
+
+	const breakdownNoun =
+		groupBy === "model"
+			? modelView === "provider"
+				? "providers"
+				: "models"
+			: groupBy === "mode"
+				? "billing modes"
+				: groupBy === "kind"
+					? "org kinds"
+					: "sources";
+	const breakdownNounSingular =
+		groupBy === "model"
+			? modelView === "provider"
+				? "Provider"
+				: "Model"
+			: groupBy === "mode"
+				? "Billing mode"
+				: groupBy === "kind"
+					? "Org kind"
+					: "Source";
+
+	const scopeNotes = [
+		usageModeDescription(usageMode),
+		orgKindDescription(orgKind),
+	].filter(Boolean);
+	const scopeParts = [
+		orgKind === "all" ? null : orgKindLabel(orgKind),
+		usageMode === "total" ? null : usageModeLabel(usageMode),
+	].filter((part): part is string => part !== null);
+	const scopeSuffix = scopeParts.map((label) => ` · ${label}`).join("");
+	const scopeLabel = scopeParts.length > 0 ? scopeParts.join(" · ") : "Total";
+
 	const breakdownTotalPages = Math.max(
 		1,
 		Math.ceil(sortedBreakdown.length / BREAKDOWN_PAGE_SIZE),
@@ -338,11 +538,19 @@ export function GlobalStatsClient() {
 						Global Stats
 					</h1>
 					<p className="mt-1 text-sm text-muted-foreground">
-						Cross-organization usage aggregated by day, grouped by model or
-						x-source header.
+						Cross-organization usage aggregated by day, grouped by model,
+						x-source header, billing mode or organization kind.
+						{scopeNotes.length > 0 ? ` ${scopeNotes.join(" ")}` : ""}
 					</p>
+					{unattributedNote ? (
+						<p className="mt-1 text-xs text-muted-foreground">
+							{unattributedNote}
+						</p>
+					) : null}
 				</div>
 				<div className="flex flex-wrap items-center gap-3">
+					<UsageModeSelector compact />
+					<OrgKindSelector compact />
 					<div className="flex items-center gap-1 rounded-md border border-border/60 bg-background p-1">
 						{GROUP_OPTIONS.map((opt) => {
 							const Icon = opt.icon;
@@ -360,18 +568,7 @@ export function GlobalStatsClient() {
 							);
 						})}
 					</div>
-					<div className="flex items-center gap-1">
-						{RANGE_OPTIONS.map((opt) => (
-							<Button
-								key={opt.value}
-								variant={range === opt.value ? "default" : "outline"}
-								size="sm"
-								onClick={() => setRange(opt.value)}
-							>
-								{opt.label}
-							</Button>
-						))}
-					</div>
+					<GlobalStatsRangePicker />
 				</div>
 			</header>
 
@@ -383,19 +580,28 @@ export function GlobalStatsClient() {
 
 			<section className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
 				<StatCard
-					label="Total requests"
+					label={`${scopeLabel} requests`}
 					value={totals ? numberFormatter.format(totals.requestCount) : "—"}
-					subtitle={isLoading ? "Loading…" : undefined}
+					subtitle={
+						isLoading
+							? "Loading…"
+							: (compositionSubtitle(modeComposition, (item) =>
+									numberFormatter.format(item.requestCount),
+								) ?? undefined)
+					}
 					icon={<BarChart3 className="h-4 w-4" />}
 					accent="blue"
 				/>
 				<StatCard
-					label="Total cost"
+					label={`${scopeLabel} cost`}
 					value={totals ? currencyFormatter.format(totals.cost) : "—"}
 					subtitle={
-						totals
-							? `Input: ${currencyFormatter.format(totals.inputCost)} · Output: ${currencyFormatter.format(totals.outputCost)}`
-							: undefined
+						!totals
+							? undefined
+							: (compositionSubtitle(kindComposition, (item) =>
+									currencyFormatter.format(item.cost),
+								) ??
+								`Input: ${currencyFormatter.format(totals.inputCost)} · Output: ${currencyFormatter.format(totals.outputCost)}`)
 					}
 					icon={<Coins className="h-4 w-4" />}
 					accent="green"
@@ -412,7 +618,7 @@ export function GlobalStatsClient() {
 					accent="orange"
 				/>
 				<StatCard
-					label={groupBy === "model" ? "Distinct models" : "Distinct sources"}
+					label={`Distinct ${breakdownNoun}`}
 					value={numberFormatter.format(breakdown.length)}
 					subtitle={
 						totals
@@ -421,7 +627,15 @@ export function GlobalStatsClient() {
 					}
 					icon={
 						groupBy === "model" ? (
-							<Cpu className="h-4 w-4" />
+							modelView === "provider" ? (
+								<Server className="h-4 w-4" />
+							) : (
+								<Cpu className="h-4 w-4" />
+							)
+						) : groupBy === "mode" ? (
+							<Wallet className="h-4 w-4" />
+						) : groupBy === "kind" ? (
+							<Building2 className="h-4 w-4" />
 						) : (
 							<Layers className="h-4 w-4" />
 						)
@@ -441,23 +655,73 @@ export function GlobalStatsClient() {
 								: chartMetric === "totalTokens"
 									? "total tokens"
 									: "request count"}{" "}
-							per day across all {groupBy === "model" ? "models" : "sources"}.
+							per day
+							{showTimeseriesBreakdown
+								? ` broken down by ${
+										groupBy === "model"
+											? modelView === "provider"
+												? "provider"
+												: modelView === "canonical"
+													? "canonical model"
+													: "mapping"
+											: breakdownNounSingular.toLowerCase()
+									}`
+								: ` across all ${breakdownNoun}`}
+							.{scopeParts.length > 0 ? ` ${scopeLabel} traffic only.` : ""}
 						</CardDescription>
 					</div>
-					<div className="flex items-center gap-1">
-						{(Object.keys(timeseriesChartConfig) as TimeseriesMetric[]).map(
-							(m) => (
-								<Button
-									key={m}
-									variant={chartMetric === m ? "default" : "outline"}
-									size="sm"
-									className="h-7 px-3 text-xs"
-									onClick={() => setChartMetric(m)}
-								>
-									{timeseriesChartConfig[m].label as string}
-								</Button>
-							),
-						)}
+					<div className="flex flex-wrap items-center gap-2">
+						<Button
+							variant={showTimeseriesBreakdown ? "default" : "outline"}
+							size="sm"
+							className="h-7 gap-1.5 px-3 text-xs"
+							onClick={toggleTimeseriesBreakdown}
+						>
+							{groupBy === "model" ? (
+								<Cpu className="h-3.5 w-3.5" />
+							) : groupBy === "mode" ? (
+								<Wallet className="h-3.5 w-3.5" />
+							) : groupBy === "kind" ? (
+								<Building2 className="h-3.5 w-3.5" />
+							) : (
+								<Layers className="h-3.5 w-3.5" />
+							)}
+							Breakdown
+						</Button>
+						{showTimeseriesBreakdown && groupBy === "model" ? (
+							<div className="flex items-center gap-1 rounded-md border border-border/60 bg-background p-1">
+								{MODEL_VIEW_OPTIONS.map((opt) => {
+									const Icon = opt.icon;
+									return (
+										<Button
+											key={opt.value}
+											variant={modelView === opt.value ? "default" : "ghost"}
+											size="sm"
+											className="h-7 gap-1.5 px-3 text-xs"
+											onClick={() => setModelView(opt.value)}
+										>
+											<Icon className="h-3.5 w-3.5" />
+											{opt.label}
+										</Button>
+									);
+								})}
+							</div>
+						) : null}
+						<div className="flex items-center gap-1">
+							{(Object.keys(timeseriesChartConfig) as TimeseriesMetric[]).map(
+								(m) => (
+									<Button
+										key={m}
+										variant={chartMetric === m ? "default" : "outline"}
+										size="sm"
+										className="h-7 px-3 text-xs"
+										onClick={() => setChartMetric(m)}
+									>
+										{timeseriesChartConfig[m].label as string}
+									</Button>
+								),
+							)}
+						</div>
 					</div>
 				</CardHeader>
 				<CardContent className="px-2 pb-4 sm:p-6">
@@ -467,10 +731,17 @@ export function GlobalStatsClient() {
 						</div>
 					) : (
 						<ChartContainer
-							config={timeseriesChartConfig}
+							config={
+								showTimeseriesBreakdown
+									? stackChartConfig
+									: timeseriesChartConfig
+							}
 							className="aspect-auto h-[320px] w-full"
 						>
-							<LineChart data={timeseries} margin={{ left: 12, right: 12 }}>
+							<BarChart
+								data={showTimeseriesBreakdown ? stackedTimeseries : timeseries}
+								margin={{ left: 12, right: 12 }}
+							>
 								<CartesianGrid vertical={false} strokeDasharray="3 3" />
 								<XAxis
 									dataKey="date"
@@ -498,7 +769,8 @@ export function GlobalStatsClient() {
 								<ChartTooltip
 									content={
 										<ChartTooltipContent
-											className="w-[180px]"
+											className="w-[220px]"
+											sortByValue={showTimeseriesBreakdown}
 											labelFormatter={(value) => {
 												if (typeof value !== "string" || !value) {
 													return "";
@@ -509,20 +781,55 @@ export function GlobalStatsClient() {
 												}
 												return format(date, "MMM d, yyyy");
 											}}
-											formatter={(value) =>
-												metricFormatter(chartMetric)(Number(value))
+											formatter={(value, name, item) =>
+												showTimeseriesBreakdown ? (
+													<div className="flex w-full items-center gap-2">
+														<span
+															className="h-2.5 w-2.5 shrink-0 rounded-[2px]"
+															style={{
+																backgroundColor:
+																	(item as { fill?: string })?.fill ??
+																	item?.color,
+															}}
+														/>
+														<span className="flex-1 text-muted-foreground">
+															{(stackChartConfig[name as string]
+																?.label as string) ?? String(name)}
+														</span>
+														<span className="font-mono font-medium tabular-nums text-foreground">
+															{metricFormatter(chartMetric)(Number(value))}
+														</span>
+													</div>
+												) : (
+													metricFormatter(chartMetric)(Number(value))
+												)
 											}
 										/>
 									}
 								/>
-								<Line
-									dataKey={chartMetric}
-									type="monotone"
-									stroke={`var(--color-${chartMetric})`}
-									strokeWidth={2}
-									dot={false}
-								/>
-							</LineChart>
+								{showTimeseriesBreakdown ? (
+									stackSeries.keys.map((key) => (
+										<Bar
+											key={key}
+											dataKey={key}
+											stackId="timeseries"
+											fill={`var(--color-${key})`}
+										/>
+									))
+								) : (
+									<Bar
+										dataKey={chartMetric}
+										fill={`var(--color-${chartMetric})`}
+										radius={[4, 4, 0, 0]}
+									/>
+								)}
+								{showTimeseriesBreakdown ? (
+									<ChartLegend
+										verticalAlign="bottom"
+										content={<ChartLegendContent />}
+									/>
+								) : null}
+							</BarChart>
 						</ChartContainer>
 					)}
 				</CardContent>
@@ -533,12 +840,14 @@ export function GlobalStatsClient() {
 					<div>
 						<CardTitle>
 							{timeseriesChartConfig[chartMetric].label as string} share —{" "}
-							{groupBy === "model" ? "models" : "sources"}
+							{breakdownNoun}
+							{scopeSuffix}
 						</CardTitle>
 						<CardDescription>
 							{breakdown.length > 10
-								? `Top 10 + Other across the ${range} window.`
-								: `All ${breakdown.length} ${groupBy === "model" ? "models" : "sources"} in the ${range} window.`}
+								? `Top 10 + Other across ${rangeLabel}.`
+								: `All ${breakdown.length} ${breakdownNoun} across ${rangeLabel}.`}
+							{scopeParts.length > 0 ? ` ${scopeLabel} traffic only.` : ""}
 						</CardDescription>
 					</div>
 					<div className="flex flex-wrap items-center gap-3">
@@ -640,7 +949,7 @@ export function GlobalStatsClient() {
 								<thead className="bg-muted/40 text-xs uppercase tracking-wide text-muted-foreground">
 									<tr>
 										<th className="px-3 py-2 text-left">
-											{groupBy === "model" ? "Model" : "Source"}
+											{breakdownNounSingular}
 										</th>
 										<th className="px-3 py-2 text-right">
 											{timeseriesChartConfig[chartMetric].label as string}
